@@ -87,20 +87,32 @@
 		codec { sound-dai = <&tfa9872>; };
 	};
 
-	/* ---- 后端（BE）：耳机/听筒/麦 = SLIMBus <-> WCD9340 ----
-	 * 先按 db845c 最小可用路径（AIF1: SLIMBUS_0_RX/TX）让卡先注册；
-	 * TODO[阶段2]: 按 UCM 改成 SLIMBUS_6_RX(耳机) / SLIMBUS_1_TX,2_TX,5_TX(各麦)。*/
-	slim-play-dai-link {
-		link-name = "SLIM Playback";
-		cpu { sound-dai = <&q6afedai SLIMBUS_0_RX>; };
+	/* ---- 后端（BE）：WCD9340 over SLIMBus，口径对齐 raphael UCM(HiFi.conf) ----
+	 * #sound-dai-cells=1 的 cell = WCD9340 dai 索引：
+	 *   AIF1_PB=0 AIF1_CAP=1 AIF2_PB=2 AIF2_CAP=3 AIF3_PB=4 AIF3_CAP=5 AIF4_PB=6 */
+	slim6-rx-dai-link {		/* 耳机：MM2 -> SLIMBUS_6_RX -> AIF4_PB */
+		link-name = "SLIMBUS_6_RX";
+		cpu { sound-dai = <&q6afedai SLIMBUS_6_RX>; };
 		platform { sound-dai = <&q6routing>; };
-		codec { sound-dai = <&wcd9340 0>; };	/* AIF1_PB */
+		codec { sound-dai = <&wcd9340 6>; };	/* AIF4_PB */
 	};
-	slim-cap-dai-link {
-		link-name = "SLIM Capture";
-		cpu { sound-dai = <&q6afedai SLIMBUS_0_TX>; };
+	slim1-tx-dai-link {		/* 底麦：MM3 <- SLIMBUS_1_TX <- AIF2_CAP */
+		link-name = "SLIMBUS_1_TX";
+		cpu { sound-dai = <&q6afedai SLIMBUS_1_TX>; };
+		platform { sound-dai = <&q6routing>; };
+		codec { sound-dai = <&wcd9340 3>; };	/* AIF2_CAP */
+	};
+	slim5-tx-dai-link {		/* 顶麦：MM4 <- SLIMBUS_5_TX <- AIF1_CAP */
+		link-name = "SLIMBUS_5_TX";
+		cpu { sound-dai = <&q6afedai SLIMBUS_5_TX>; };
 		platform { sound-dai = <&q6routing>; };
 		codec { sound-dai = <&wcd9340 1>; };	/* AIF1_CAP */
+	};
+	slim2-tx-dai-link {		/* 耳麦：MM5 <- SLIMBUS_2_TX <- AIF3_CAP */
+		link-name = "SLIMBUS_2_TX";
+		cpu { sound-dai = <&q6afedai SLIMBUS_2_TX>; };
+		platform { sound-dai = <&q6routing>; };
+		codec { sound-dai = <&wcd9340 5>; };	/* AIF3_CAP */
 	};
 };
 
