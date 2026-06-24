@@ -22,6 +22,7 @@
 #define SLIM_MAX_TX_PORTS 16
 #define SLIM_MAX_RX_PORTS 13
 #define WCD934X_DEFAULT_MCLK_RATE	9600000
+#define MI2S_BCLK_RATE			1536000
 
 struct sm8150_snd_data {
 	struct snd_soc_jack jack;
@@ -207,6 +208,9 @@ static int sm8150_snd_hw_params(struct snd_pcm_substream *substream,
 	case SLIMBUS_0_RX...SLIMBUS_6_TX:
 		ret = sm8150_slim_snd_hw_params(substream, params);
 		break;
+	case QUATERNARY_MI2S_RX:
+		/* MI2S 时钟/格式在 startup 里配置，这里无需特殊处理 */
+		break;
 	default:
 		pr_err("%s: invalid dai id 0x%x\n", __func__, cpu_dai->id);
 		break;
@@ -317,6 +321,15 @@ static int sm8150_snd_startup(struct snd_pcm_substream *substream)
 		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
 		break;
 	case SLIMBUS_0_RX...SLIMBUS_6_TX:
+		break;
+	case QUATERNARY_MI2S_RX:
+		/* 扬声器：QUAT MI2S，q6afe 作 master，TFA 作 slave；I2S 格式 */
+		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
+		snd_soc_dai_set_sysclk(cpu_dai,
+			Q6AFE_LPASS_CLK_ID_QUAD_MI2S_IBIT,
+			MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
+		snd_soc_dai_set_fmt(cpu_dai, fmt);
+		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
 		break;
 	default:
 		pr_err("%s: invalid dai id 0x%x\n", __func__, cpu_dai->id);
