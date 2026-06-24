@@ -43,10 +43,9 @@
 	compatible = "qcom,sm8150-sndcard";	/* 由 CONFIG_SND_SOC_SM8150 驱动 */
 	model = "Xiaomi-Redmi-K20-Pro";
 
-	/* TODO[阶段2]: 确认 sm8150.dtsi 是否已有 quat_mi2s pinmux 组；
-	 * 若无，需在下方 &tlmm 补 quat_mi2s_active/_sleep（本文件已给占位）。*/
-	pinctrl-names = "default";
-	pinctrl-0 = <&quat_mi2s_active>;
+	/* [stage1] 不在 &sound 上挂 pinctrl：空的 quat_mi2s 占位会让 driver core 套 "default"
+	 * 状态时报 "there are no valid maps for state default" 并阻塞声卡注册。
+	 * QUAT MI2S 引脚(扬声器/TFA)留到 stage2 用真实 GPIO 补，届时再恢复 pinctrl-0。 */
 
 	/* audio-routing：取自下游 raphael-audio-overlay.dtsi（WCD934x widget 名 mainline 通用）。
 	 * TODO[阶段2]: 逐条核对 mainline wcd934x 的 widget 名（如 LINEOUT/AMIC/MIC BIAS）。*/
@@ -206,9 +205,7 @@
 	};
 };
 
-/* ======================= pinctrl 占位 =======================
- * TODO[阶段2]: 以下 GPIO/function 需按 raphael 下游 pinctrl 填准确值。
- * 卡的注册（阶段1）不依赖这些；音频实际出声（阶段2）才需要。*/
+/* ======================= pinctrl ======================= */
 &tlmm {
 	/* WCD9340 中断脚（CODEC_INT1_N = GPIO123）*/
 	wcd_intr_default: wcd-intr-default-state {
@@ -218,11 +215,8 @@
 		drive-strength = <2>;
 	};
 
-	/* QUAT MI2S（扬声器 I2S）—— TODO: 填准确 GPIO（下游 SPKR_I2S_BCK/WS/DOUT/DIN）*/
-	quat_mi2s_active: quat-mi2s-active-state {
-		/* TODO: pins = "gpioXXX..."; function = "mi2s..."; */
-	};
-	quat_mi2s_sleep: quat-mi2s-sleep-state {
-		/* TODO */
-	};
+	/* [stage2 TODO] QUAT MI2S（扬声器/TFA 走 I2S）的 pinmux 待补：
+	 * 需用 raphael 下游 SPKR_I2S_BCK/WS/DOUT/DIN 的真实 GPIO 号 + function 定义
+	 * quat_mi2s_active/_sleep，并在 &sound 恢复 pinctrl-0。空节点会触发
+	 * "no valid maps for state default" 阻塞声卡注册，故 stage1 先不放。*/
 };
