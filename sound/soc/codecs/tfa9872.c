@@ -96,6 +96,18 @@ static int tfa987x_digital_mute(struct snd_soc_dai *codec_dai, int mute, int str
 	snd_soc_component_update_bits(component, TFA987X_SYS_CTRL0,
 						 TFA987X_SYS_CTRL0_AMPE_MSK, val);
 
+	/* spk-vol: 刷机后用 `dmesg | grep spk-vol` 看每次播放起停时的实际增益寄存器值，
+	 * 配合 `amixer -c0 cset name='Speaker Volume' N` 验证 AMP_CFG 增益方向/单调性。 */
+	{
+		unsigned int ampcfg = snd_soc_component_read(component,
+							     TFA987X_AMP_CFG);
+
+		dev_info(component->dev,
+			 "spk-vol: amp %s AMP_CFG=0x%04x gain(bit5-12)=%lu\n",
+			 mute ? "disable" : "enable", ampcfg,
+			 FIELD_GET(TFA987X_AMP_CFG_GAIN_MSK, ampcfg));
+	}
+
 	return 0;
 }
 
@@ -109,7 +121,21 @@ static const struct snd_soc_dapm_route tfa987x_dapm_routes[] = {
 	{"Speaker", NULL, "PWUP"},
 };
 
+/* 扬声器硬件音量：暴露 AMP_CFG(0x52) 的 GAIN 字段(bit5..12，8 位)为 ALSA 控件，
+ * 让 PipeWire/Plasma/UCM 能直接控硬件增益（耳机走 WCD 已有硬件音量，扬声器原本一个都没有，
+ * 只能软件衰减）。SOC_SINGLE 只动 bit5..12，不碰同寄存器的 CLIPCTRL/SLOPE 位。
+ *
+ * 说明/待验证：mainline 这版 TFA 驱动不跑 NXP 私有 DSP，故无法走 DSP 平滑音量；AMP_CFG GAIN
+ * 是放大器增益字段(可能为较粗的档位而非 256 级平滑)。即便偏粗也无妨——PipeWire 会用软件音量
+ * 补足细分。invert=0 假定「寄存器值越大=增益越大」；刷机后用 `amixer -c0 cset name='Speaker Volume' N`
+ * 边扫边听确认方向/单调性（若发现越大越小，改 invert=1）。不用此控件时等于无害空操作。 */
+static const struct snd_kcontrol_new tfa987x_snd_controls[] = {
+	SOC_SINGLE("Speaker Volume", TFA987X_AMP_CFG, 5, 0xff, 0),
+};
+
 static const struct snd_soc_component_driver tfa987x_component = {
+	.controls		= tfa987x_snd_controls,
+	.num_controls		= ARRAY_SIZE(tfa987x_snd_controls),
 	.dapm_widgets		= tfa987x_dapm_widgets,
 	.num_dapm_widgets	= ARRAY_SIZE(tfa987x_dapm_widgets),
 	.dapm_routes		= tfa987x_dapm_routes,
@@ -292,6 +318,20 @@ static int tfa987x_i2c_probe(struct i2c_client *i2c)
 	regmap_update_bits(rmap, TFA987X_SYS_CTRL1,
 				 TFA987X_SYS_CTRL1_MANSCONF_MSK,
 				 TFA987X_SYS_CTRL1_MANSCONF_MSK);
+
+	/* spk-vol: 记录上电后默认增益/DCDC，便于评估「Speaker Volume」量程与是否需要 boost。 */
+	{
+		unsigned int ampcfg = 0, tdm8 = 0, dcdc0 = 0;
+
+		regmap_read(rmap, TFA987X_AMP_CFG, &ampcfg);
+		regmap_read(rmap, TFA987X_TDM_CFG8, &tdm8);
+		regmap_read(rmap, TFA987X_DCDC_CTRL0, &dcdc0);
+		dev_info(dev,
+			 "spk-vol: init rev=0x%04x AMP_CFG=0x%04x gain=%lu TDM_CFG8=0x%04x SPKG=%lu DCDC_CTRL0=0x%04x(boost=%s)\n",
+			 rev, ampcfg, FIELD_GET(TFA987X_AMP_CFG_GAIN_MSK, ampcfg),
+			 tdm8, FIELD_GET(TFA987X_TDM_CFG8_SPKG_MSK, tdm8), dcdc0,
+			 (dcdc0 & TFA987X_DCDC_CTRL0_DCIE_MSK) ? "on" : "off");
+	}
 
 	return devm_snd_soc_register_component(dev, &tfa987x_component,
 						    &tfa987x_dai, 1);

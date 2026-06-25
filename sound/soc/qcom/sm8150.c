@@ -103,6 +103,15 @@ static int sm8150_slim_snd_hw_params(struct snd_pcm_substream *substream,
 			continue;
 		}
 
+		/* mic-cap: 机器驱动从 wcd codec_dai 取到的 SLIM 通道，再转设给 q6afe cpu_dai。
+		 * 捕获(TX)时 tx_ch_cnt=0 即零数据根因（wcd 没返回 TX 通道）。 */
+		dev_info(cpu_dai->dev,
+			 "mic-cap: sm8150 slim hw_params cpu=%d codec=%s %s tx_cnt=%u tx0=%u rx_cnt=%u rx0=%u\n",
+			 cpu_dai->id, codec_dai->name,
+			 (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) ? "PB" : "CAP",
+			 tx_ch_cnt, tx_ch_cnt ? tx_ch[0] : 0,
+			 rx_ch_cnt, rx_ch_cnt ? rx_ch[0] : 0);
+
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 			ret = snd_soc_dai_set_channel_map(cpu_dai, 0, NULL,
 							  rx_ch_cnt, rx_ch);

@@ -1976,6 +1976,11 @@ static int wcd934x_get_channel_map(const struct snd_soc_dai *dai,
 			tx_slot[i++] = ch->ch_num;
 
 		*tx_num = i;
+		/* mic-cap: tx_num=0 即捕获零数据根因之一（SLIM TX 通道没挂进 AIF_CAP 链表）。 */
+		dev_info(wcd->dev,
+			 "mic-cap: wcd get_channel_map AIF_CAP dai=%d tx_num=%d ch0=%d ch1=%d\n",
+			 dai->id, i, i > 0 ? tx_slot[0] : -1,
+			 i > 1 ? tx_slot[1] : -1);
 		break;
 	default:
 		dev_err(wcd->dev, "Invalid DAI ID %x\n", dai->id);
@@ -3820,6 +3825,12 @@ static int slim_tx_mixer_put(struct snd_kcontrol *kc,
 		if (!found)
 			return 0;
 	 }
+
+	/* mic-cap: 看 AIFx_CAP Mixer SLIM TXn 是否真把 tx_chs[port] 挂进 AIF_CAP 链表
+	 * （挂上后 get_channel_map 才返回 tx_num>0）。 */
+	dev_info(wcd->dev,
+		 "mic-cap: slim_tx_mixer dai=%d port=%d enable=%d ch_num=%d\n",
+		 dai_id, port_id, enable, wcd->tx_chs[port_id].ch_num);
 
 	wcd->tx_port_value[port_id] = enable;
 	snd_soc_dapm_mixer_update_power(widget->dapm, kc, enable, update);

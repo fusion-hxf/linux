@@ -61,6 +61,9 @@ static int q6slim_hw_params(struct snd_pcm_substream *substream,
 		return -EINVAL;
 	}
 
+	dev_info(dai->dev, "mic-cap: q6slim hw_params dai=%d rate=%u bit_width=%u\n",
+		 dai->id, slim->sample_rate, slim->bit_width);
+
 	return 0;
 }
 
@@ -481,6 +484,14 @@ static int q6slim_set_channel_map(struct snd_soc_dai *dai,
 		pcfg->slim.num_channels = rx_num;
 
 	}
+
+	/* mic-cap: q6afe 侧拿到的 SLIM 通道映射；TX 若 num_ch=0 或 map 与 wcd 不一致 → 捕获零数据/端口异常。 */
+	dev_info(dai->dev,
+		 "mic-cap: q6slim set_channel_map dai=%d %s num_ch=%u map=%u,%u,%u,%u\n",
+		 dai->id, (dai->id & 0x1) ? "TX" : "RX",
+		 pcfg->slim.num_channels, pcfg->slim.ch_mapping[0],
+		 pcfg->slim.ch_mapping[1], pcfg->slim.ch_mapping[2],
+		 pcfg->slim.ch_mapping[3]);
 
 	return 0;
 }

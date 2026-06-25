@@ -1339,6 +1339,12 @@ void q6afe_slim_port_prepare(struct q6afe_port *port,
 	pcfg->slim_cfg.shared_ch_mapping[2] = cfg->ch_mapping[2];
 	pcfg->slim_cfg.shared_ch_mapping[3] = cfg->ch_mapping[3];
 
+	/* mic-cap: 发给 ADSP 的 SLIM 端口最终配置。捕获零数据时核对 num_ch/map 是否合理。 */
+	dev_info(port->afe->dev,
+		 "mic-cap: slim port_prepare id=0x%x num_ch=%u rate=%u bw=%u map=%u,%u,%u,%u\n",
+		 port->id, cfg->num_channels, cfg->sample_rate, cfg->bit_width,
+		 cfg->ch_mapping[0], cfg->ch_mapping[1], cfg->ch_mapping[2],
+		 cfg->ch_mapping[3]);
 }
 EXPORT_SYMBOL_GPL(q6afe_slim_port_prepare);
 
@@ -1672,6 +1678,10 @@ int q6afe_port_start(struct q6afe_port *port)
 	int ret, param_id = port->cfg_type;
 	struct apr_pkt *pkt;
 	int pkt_size;
+
+	/* mic-cap: 每次 AFE 端口启动都记一条；用于抓「谁在开机时启动了 SLIMBUS_1_TX(0x4003)」
+	 * 导致捕获时 DEVICE_START 返回 ADSP_EALREADY(0x9)。 */
+	dev_info(afe->dev, "mic-cap: q6afe_port_start id=0x%x\n", port_id);
 
 	ret  = q6afe_port_set_param_v2(port, &port->port_cfg, param_id,
 				       AFE_MODULE_AUDIO_DEV_INTERFACE,
