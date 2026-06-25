@@ -22,6 +22,7 @@
 #define SLIM_MAX_TX_PORTS 16
 #define SLIM_MAX_RX_PORTS 13
 #define WCD934X_DEFAULT_MCLK_RATE	9600000
+#define DEFAULT_MCLK_RATE		24576000
 #define MI2S_BCLK_RATE			1536000
 
 struct sm8150_snd_data {
@@ -334,8 +335,14 @@ static int sm8150_snd_startup(struct snd_pcm_substream *substream)
 	case SLIMBUS_0_RX...SLIMBUS_6_TX:
 		break;
 	case QUATERNARY_MI2S_RX:
-		/* 扬声器：QUAT MI2S，q6afe 作 master，TFA 作 slave；I2S 格式 */
+		/* 扬声器：QUAT MI2S，q6afe 作 master，TFA 作 slave；I2S 格式。
+		 * LPASS MI2S 端口除了位时钟(IBIT)，还需先使能 MCLK 根时钟——否则端口能
+		 * 配置(port_start 成功)但数据一流动 ADSP 就静默失败 → aplay 写入 EIO。
+		 * 参照 sdm845.c 的 MI2S 处理：MCLK_1 + <port>_MI2S_IBIT 成对设置。 */
 		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
+		snd_soc_dai_set_sysclk(cpu_dai,
+			Q6AFE_LPASS_CLK_ID_MCLK_1,
+			DEFAULT_MCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
 		snd_soc_dai_set_sysclk(cpu_dai,
 			Q6AFE_LPASS_CLK_ID_QUAD_MI2S_IBIT,
 			MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
