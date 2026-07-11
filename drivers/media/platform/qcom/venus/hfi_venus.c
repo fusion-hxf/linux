@@ -366,6 +366,7 @@ static void venus_free(struct venus_hfi_device *hdev, struct mem_desc *mem)
 
 static void venus_set_registers(struct venus_hfi_device *hdev)
 {
+	struct venus_core *core = hdev->core;
 	const struct venus_resources *res = hdev->core->res;
 	const struct reg_val *tbl = res->reg_tbl;
 	unsigned int count = res->reg_tbl_size;
@@ -373,6 +374,17 @@ static void venus_set_registers(struct venus_hfi_device *hdev)
 
 	for (i = 0; i < count; i++)
 		writel(tbl[i].value, hdev->core->base + tbl[i].reg);
+
+	/*
+	 * Iris1 loses these wrapper settings when its GDSC is power-cycled.
+	 * Qualcomm's downstream sequence restores both immediately after the
+	 * clocks are enabled and before asking the firmware CPU to boot.
+	 */
+	if (IS_IRIS1(core)) {
+		writel(0, core->wrapper_base + WRAPPER_CPU_CGC_DIS);
+		writel(0, core->wrapper_base + WRAPPER_CPU_CLOCK_CONFIG);
+		dev_info(core->dev, "Iris1 CPU clock gating configured\n");
+	}
 }
 
 static void venus_soft_int(struct venus_hfi_device *hdev)
@@ -466,7 +478,7 @@ static int venus_hfi_core_set_resource(struct venus_core *core, u32 id,
 static int venus_boot_core(struct venus_hfi_device *hdev)
 {
 	struct device *dev = hdev->core->dev;
-	static const unsigned int max_tries = 100;
+	static const unsigned int max_tries = 1000;
 	u32 ctrl_status = 0, mask_val = 0;
 	unsigned int count = 0;
 	void __iomem *cpu_cs_base = hdev->core->cpu_cs_base;
@@ -477,11 +489,18 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 		mask_val = readl(wrapper_base + WRAPPER_INTR_MASK);
 		mask_val &= ~(WRAPPER_INTR_MASK_A2HWD_BASK_V6 |
 			      WRAPPER_INTR_MASK_A2HCPU_MASK);
+	} else if (IS_IRIS1(hdev->core)) {
+		mask_val = readl(wrapper_base + WRAPPER_INTR_MASK);
+		mask_val &= ~(WRAPPER_INTR_MASK_A2HWD_BASK |
+			      WRAPPER_INTR_MASK_A2HCPU_MASK);
 	} else {
 		mask_val = WRAPPER_INTR_MASK_A2HVCODEC_MASK;
 	}
 
 	writel(mask_val, wrapper_base + WRAPPER_INTR_MASK);
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev, "Iris1 interrupts unmasked: mask=%#x\n", mask_val);
+
 	if (IS_V1(hdev->core))
 		writel(1, cpu_cs_base + CPU_CS_SCIACMDARG3);
 
@@ -494,12 +513,26 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 			break;
 		}
 
-		usleep_range(500, 1000);
+		usleep_range(50, 100);
 		count++;
 	}
 
-	if (count >= max_tries)
+	if (count >= max_tries) {
+		dev_err(dev,
+			"boot timeout: init=%#x status=%#x intr-mask=%#x intr-status=%#x cpu-status=%#x cpu-clk=%#x cpu-cgc=%#x hw-version=%#x\n",
+			readl(cpu_cs_base + VIDC_CTRL_INIT), ctrl_status,
+			readl(wrapper_base + WRAPPER_INTR_MASK),
+			readl(wrapper_base + WRAPPER_INTR_STATUS),
+			readl(wrapper_base + WRAPPER_CPU_STATUS),
+			readl(wrapper_base + WRAPPER_CPU_CLOCK_CONFIG),
+			readl(wrapper_base + WRAPPER_CPU_CGC_DIS),
+			readl(wrapper_base + WRAPPER_HW_VERSION));
 		ret = -ETIMEDOUT;
+	}
+
+	if (!ret && IS_IRIS1(hdev->core))
+		dev_info(dev, "Iris1 boot ready: status=%#x polls=%u\n",
+			 ctrl_status, count);
 
 	if (IS_IRIS2(hdev->core) || IS_IRIS2_1(hdev->core) || IS_AR50_LITE(hdev->core)) {
 		writel(0x1, cpu_cs_base + CPU_CS_H2XSOFTINTEN_V6);
@@ -548,6 +581,17 @@ static int venus_run(struct venus_hfi_device *hdev)
 	writel(0x01, cpu_cs_base + CPU_CS_SCIACMDARG1);
 	if (hdev->sfr.da)
 		writel(hdev->sfr.da, cpu_cs_base + SFR_ADDR);
+
+	/* Iris1 exposes an additional DSP view of the same HFI queues. */
+	if (IS_IRIS1(hdev->core)) {
+		writel(hdev->ifaceq_table.da,
+		       cpu_cs_base + HFI_DSP_QTBL_ADDR);
+		writel(hdev->ifaceq_table.da,
+		       cpu_cs_base + HFI_DSP_UC_REGION_ADDR);
+		writel(SHARED_QSIZE, cpu_cs_base + HFI_DSP_UC_REGION_SIZE);
+		dev_info(dev, "Iris1 HFI queues: dma=%pad size=%#x\n",
+			 &hdev->ifaceq_table.da, (u32)SHARED_QSIZE);
+	}
 
 	ret = venus_boot_core(hdev);
 	if (ret) {

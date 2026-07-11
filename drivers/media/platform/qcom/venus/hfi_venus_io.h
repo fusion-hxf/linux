@@ -25,6 +25,11 @@
 
 #define CPU_CS_A2HSOFTINTCLR			0x1c
 
+/* Iris1 DSP queue and uncached-region registers, relative to CPU_CS_BASE. */
+#define HFI_DSP_QTBL_ADDR			0x34
+#define HFI_DSP_UC_REGION_ADDR			0x38
+#define HFI_DSP_UC_REGION_SIZE			0x3c
+
 #define VIDC_CTRL_INIT				0x48
 #define VIDC_CTRL_INIT_RESERVED_BITS31_1_MASK	0xfffffffe
 #define VIDC_CTRL_INIT_RESERVED_BITS31_1_SHIFT	1
