@@ -72,8 +72,8 @@ static int core_clks_enable(struct venus_core *core)
 
 	if (IS_IRIS1(core)) {
 		for (i = 0; i < res->clks_num; i++)
-			dev_info(dev, "Iris1 clock %s: enabled=%d rate=%lu\n",
-				 res->clks[i], __clk_is_enabled(core->clks[i]),
+			dev_info(dev, "Iris1 clock %s enabled: rate=%lu\n",
+				 res->clks[i],
 				 clk_get_rate(core->clks[i]));
 	}
 
