@@ -21,11 +21,12 @@ properties:
     const: qcom,sm8150-venus
 
   clocks:
-    maxItems: 3
+    maxItems: 4
 
   clock-names:
     items:
       - const: iface
+      - const: bus
       - const: core
       - const: vcodec0_core
 

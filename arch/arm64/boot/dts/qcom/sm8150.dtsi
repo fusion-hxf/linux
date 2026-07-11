@@ -3821,9 +3821,10 @@
 			interrupts = <GIC_SPI 174 IRQ_TYPE_LEVEL_HIGH>;
 
 			clocks = <&gcc GCC_VIDEO_AXI0_CLK>,
+				 <&gcc GCC_VIDEO_AXIC_CLK>,
 				 <&videocc VIDEO_CC_MVSC_CORE_CLK>,
 				 <&videocc VIDEO_CC_MVS0_CORE_CLK>;
-			clock-names = "iface", "core", "vcodec0_core";
+			clock-names = "iface", "bus", "core", "vcodec0_core";
 
 			power-domains = <&videocc VENUS_GDSC>,
 					<&videocc VCODEC0_GDSC>,
