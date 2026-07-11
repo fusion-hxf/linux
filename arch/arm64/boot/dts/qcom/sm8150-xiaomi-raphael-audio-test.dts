@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Raphael audio bring-up DT.
+ *
+ * The base DT remains the known-booting fallback.  This variant opts into
+ * the external reset and the NXP 0x0c74 revision configuration so it can be
+ * tested independently from Venus changes.
+ */
+
+#include "sm8150-xiaomi-raphael.dts"
+
+/ {
+	model = "Xiaomi Redmi K20 Pro (audio bring-up)";
+};
+
+&tfa9872 {
+	nxp,hardware-reset;
+	nxp,apply-revision-config;
+};

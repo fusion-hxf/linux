@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Combined variant for use only after the isolated audio/video tests pass. */
+
+#include "sm8150-xiaomi-raphael.dts"
+
+/ {
+	model = "Xiaomi Redmi K20 Pro (combined bring-up)";
+};
+
+&tfa9872 {
+	nxp,hardware-reset;
+	nxp,apply-revision-config;
+};
+
+&venus {
+	firmware-name = "qcom/sm8150/Xiaomi/raphael/venus.mbn";
+	status = "okay";
+};

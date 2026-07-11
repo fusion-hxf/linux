@@ -919,6 +919,35 @@ static int core_resets_reset(struct venus_core *core)
 	if (!res->resets_num)
 		return 0;
 
+	/*
+	 * IRIS1 has a four-reset AHB-to-AXI bridge.  Qualcomm's downstream
+	 * VPU_VERSION_5 sequence asserts the complete set, waits, and then
+	 * deasserts it.  Keep this behavior isolated to IRIS1; established
+	 * platforms retain the existing per-reset pulse sequence below.
+	 */
+	if (IS_IRIS1(core)) {
+		for (i = 0; i < res->resets_num; i++) {
+			ret = reset_control_assert(core->resets[i]);
+			if (ret)
+				goto err_deassert;
+		}
+
+		usleep_range(150, 250);
+
+		for (i = 0; i < res->resets_num; i++) {
+			ret = reset_control_deassert(core->resets[i]);
+			if (ret)
+				return ret;
+		}
+
+		return 0;
+
+err_deassert:
+		while (i--)
+			reset_control_deassert(core->resets[i]);
+		return ret;
+	}
+
 	for (i = 0; i < res->resets_num; i++) {
 		ret = reset_control_assert(core->resets[i]);
 		if (ret)

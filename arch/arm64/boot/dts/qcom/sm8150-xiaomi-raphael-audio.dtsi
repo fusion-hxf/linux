@@ -198,9 +198,9 @@
 	};
 };
 
-/* ======================= TFA9872 扬声器功放 on I2C =======================
+/* ======================= TFA9874 扬声器功放 on I2C =======================
  * 下游：qupv3_se1_i2c @ 0x34，reset GPIO59(SPKR_PA_RST)，irq GPIO141(SPKR_INT)。
- * mainline i2c1 = i2c@884000 = QUP0 SE1。驱动 = GengWei raphael-7.1 的 tfa9872（nxp,tfa9872/9874）。
+ * 实机 revision 0x0c74 已确认是 TFA9874；mainline i2c1 = i2c@884000 = QUP0 SE1。
  * 关键：i2c1 的父 GENI QUP 包装器 qupv3_id_0 默认 disabled，必须一并 enable，
  * 否则 i2c1 总线起不来、tfa 不 probe → 声卡因 "Speaker Playback: codec dai not found" 永久 defer。*/
 &qupv3_id_0 {
@@ -212,19 +212,54 @@
 	clock-frequency = <400000>;
 
 	tfa9872: speaker-amp@34 {
-		compatible = "nxp,tfa9872";	/* TODO: 若实测为 tfa9874 改之；驱动两者都认 */
+		compatible = "nxp,tfa9874";
 		reg = <0x34>;
 		#sound-dai-cells = <0>;
 		/* SPKR_PA_RST = GPIO59；SPKR_INT = GPIO141 */
-		reset-gpios = <&tlmm 59 GPIO_ACTIVE_HIGH>;	/* TODO: 核对 tfa9872 驱动是否读 reset-gpios */
+		reset-gpios = <&tlmm 59 GPIO_ACTIVE_HIGH>;
 		interrupt-parent = <&tlmm>;
 		interrupts = <141 IRQ_TYPE_EDGE_FALLING>;
-		/* TODO[阶段2]: pinctrl smartpa_int/enable（见下方 &tlmm 占位）*/
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&smartpa_int_active &smartpa_reset_active>;
+		pinctrl-1 = <&smartpa_int_sleep &smartpa_reset_sleep>;
 	};
 };
 
 /* ======================= pinctrl ======================= */
 &tlmm {
+	smartpa_int_active: smartpa-int-active-state {
+		pins = "gpio141";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
+	};
+
+	smartpa_int_sleep: smartpa-int-sleep-state {
+		pins = "gpio141";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
+	};
+
+	/* TFA9874 reset is active high; inactive/output-low is the normal state. */
+	smartpa_reset_active: smartpa-reset-active-state {
+		pins = "gpio59";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-low;
+	};
+
+	smartpa_reset_sleep: smartpa-reset-sleep-state {
+		pins = "gpio59";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-low;
+	};
+
 	/* WCD9340 中断脚（CODEC_INT1_N = GPIO123）*/
 	wcd_intr_default: wcd-intr-default-state {
 		pins = "gpio123";

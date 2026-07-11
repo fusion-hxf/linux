@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Raphael Venus/Iris1 bring-up DT.  The production/base DT keeps Venus off. */
+
+#include "sm8150-xiaomi-raphael.dts"
+
+/ {
+	model = "Xiaomi Redmi K20 Pro (Venus bring-up)";
+};
+
+&venus {
+	firmware-name = "qcom/sm8150/Xiaomi/raphael/venus.mbn";
+	status = "okay";
+};

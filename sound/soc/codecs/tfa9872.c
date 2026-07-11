@@ -6,8 +6,11 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/delay.h>
+#include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <sound/soc.h>
 
@@ -27,6 +30,9 @@
 
 #define TFA987X_REV			0x03
 #define TFA987X_CLK_GATING_CTRL		0x05
+#define TFA987X_KEY1_CONTROL		0x0f
+#define TFA987X_STATUS_FLAGS0		0x10
+#define TFA987X_STATUS_FLAGS1		0x11
 
 #define TFA987X_TDM_CFG0		0x20
 #define TFA987X_TDM_CFG0_FSBCLKS_MSK	GENMASK(15, 12)
@@ -42,7 +48,7 @@
 #define TFA987X_TDM_CFG3_VSE_MSK	BIT(4)
 #define TFA987X_TDM_CFG6		0x26
 #define TFA987X_TDM_CFG6_SPKS_MSK	GENMASK(3,  0)
-#define TFA987X_TDM_CFG6_DCS_MSK	GENMASK(4,  7)
+#define TFA987X_TDM_CFG6_DCS_MSK	GENMASK(7,  4)
 #define TFA987X_TDM_CFG6_CSS_MSK	GENMASK(15, 12)
 #define TFA987X_TDM_CFG7		0x27
 #define TFA987X_TDM_CFG7_VSS_MSK	GENMASK(3,  0)
@@ -85,6 +91,99 @@
 #define TFA9874_DCDC_CTRL6_DCVOF_MSK	GENMASK(8,  3)
 #define TFA9874_DCDC_CTRL6_DCVOS_MSK	GENMASK(14,  9)
 
+#define TFA9874_KEY1_XOR_SOURCE		0xfb
+#define TFA9874_KEY1_UNLOCK		0xa0
+#define TFA9874_KEY2_CONTROL		0xa1
+
+/*
+ * NXP's downstream TFA98xx driver applies this generated V1.14 sequence to
+ * revision 0x0c74.  Keep it opt-in through nxp,apply-revision-config so the
+ * known-booting Raphael DT remains an unchanged fallback.
+ */
+static const struct reg_sequence tfa9874_0c74_init[] = {
+	{ 0x02, 0x22c8 },
+	{ 0x52, 0x57dc },
+	{ 0x53, 0x003e },
+	{ 0x56, 0x0400 },
+	{ 0x61, 0x0110 },
+	{ 0x6f, 0x00a5 },
+	{ 0x70, 0x07f8 },
+	{ 0x73, 0x0047 },
+	{ 0x74, 0x5098 },
+	{ 0x75, 0x8d28 },
+	{ 0x80, 0x0000 },
+	{ 0x83, 0x0799 },
+	{ 0x84, 0x0081 },
+};
+
+static int tfa9874_apply_revision_config(struct device *dev,
+					 struct regmap *rmap, unsigned int rev)
+{
+	unsigned int value;
+	int ret;
+
+	if (rev != 0x0c74) {
+		dev_err(dev, "revision config requested for unsupported revision 0x%04x\n",
+			rev);
+		return -EINVAL;
+	}
+
+	/* Unlock KEY1, then KEY2, following the NXP downstream sequence. */
+	ret = regmap_write(rmap, TFA987X_KEY1_CONTROL, 0x5a6b);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(rmap, TFA9874_KEY1_XOR_SOURCE, &value);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(rmap, TFA9874_KEY1_UNLOCK, value ^ 0x005a);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(rmap, TFA987X_KEY1_CONTROL, 0x5a6b);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(rmap, TFA9874_KEY2_CONTROL, 0x005a);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(rmap, TFA987X_KEY1_CONTROL, 0x0000);
+	if (ret)
+		return ret;
+
+	ret = regmap_multi_reg_write(rmap, tfa9874_0c74_init,
+				     ARRAY_SIZE(tfa9874_0c74_init));
+	if (ret)
+		return ret;
+
+	dev_info(dev, "applied TFA9874 revision 0x0c74 V1.14 configuration\n");
+	return 0;
+}
+
+static int tfa987x_hardware_reset(struct device *dev)
+{
+	struct gpio_desc *reset;
+
+	if (!device_property_read_bool(dev, "nxp,hardware-reset"))
+		return 0;
+
+	reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(reset))
+		return dev_err_probe(dev, PTR_ERR(reset),
+				     "failed to acquire reset GPIO\n");
+
+	/* Raphael's TFA reset is active high: assert, then release. */
+	gpiod_set_value_cansleep(reset, 1);
+	usleep_range(10000, 11000);
+	gpiod_set_value_cansleep(reset, 0);
+	usleep_range(10000, 11000);
+
+	dev_info(dev, "completed external hardware reset\n");
+	return 0;
+}
+
 static int tfa987x_digital_mute(struct snd_soc_dai *codec_dai, int mute, int stream)
 {
 	struct snd_soc_component *component = codec_dai->component;
@@ -96,16 +195,25 @@ static int tfa987x_digital_mute(struct snd_soc_dai *codec_dai, int mute, int str
 	snd_soc_component_update_bits(component, TFA987X_SYS_CTRL0,
 						 TFA987X_SYS_CTRL0_AMPE_MSK, val);
 
-	/* spk-vol: 刷机后用 `dmesg | grep spk-vol` 看每次播放起停时的实际增益寄存器值，
+	/*
+	 * spk-state: 用 dmesg | grep spk-state 查看播放起停时的寄存器值，
 	 * 配合 `amixer -c0 cset name='Speaker Volume' N` 验证 AMP_CFG 增益方向/单调性。 */
 	{
-		unsigned int ampcfg = snd_soc_component_read(component,
-							     TFA987X_AMP_CFG);
+		unsigned int ampcfg = snd_soc_component_read(component, TFA987X_AMP_CFG);
+		unsigned int status0 = snd_soc_component_read(component,
+							      TFA987X_STATUS_FLAGS0);
+		unsigned int status1 = snd_soc_component_read(component,
+							      TFA987X_STATUS_FLAGS1);
+		unsigned int sysctrl0 = snd_soc_component_read(component,
+							       TFA987X_SYS_CTRL0);
+		unsigned int tdm3 = snd_soc_component_read(component, TFA987X_TDM_CFG3);
+		unsigned int dcdc0 = snd_soc_component_read(component, TFA987X_DCDC_CTRL0);
 
 		dev_info(component->dev,
-			 "spk-vol: amp %s AMP_CFG=0x%04x gain(bit5-12)=%lu\n",
-			 mute ? "disable" : "enable", ampcfg,
-			 FIELD_GET(TFA987X_AMP_CFG_GAIN_MSK, ampcfg));
+			 "spk-state: amp %s SYS=0x%04x STATUS=0x%04x/0x%04x TDM3=0x%04x AMP=0x%04x gain=%lu DCDC0=0x%04x\n",
+			 mute ? "disable" : "enable", sysctrl0,
+			 status0, status1, tdm3, ampcfg,
+			 FIELD_GET(TFA987X_AMP_CFG_GAIN_MSK, ampcfg), dcdc0);
 	}
 
 	return 0;
@@ -171,7 +279,7 @@ static const struct regmap_config tfa987x_regmap_config = {
 
 static bool tfa987x_setup_dcdc(struct device *dev, struct regmap *rmap, u16 rev)
 {
-	u32 mcc, dcvof, dcvos, dctrip, dctrip2 = 0;
+	u32 mcc = 0, dcvof = 0, dcvos = 0, dctrip = 0, dctrip2 = 0;
 	int i;
 	u32 *dest[] = { &mcc, &dcvof, &dcvos, &dctrip, &dctrip2 };
 	const char *props[] = { "max-coil-current",
@@ -216,7 +324,7 @@ static bool tfa987x_setup_dcdc(struct device *dev, struct regmap *rmap, u16 rev)
 					FIELD_PREP(TFA9874_DCDC_CTRL6_DCVOF_MSK, dcvof));
 
 		if (dcvos)
-			regmap_update_bits(rmap, TFA987X_DCDC_CTRL0,
+			regmap_update_bits(rmap, TFA987X_DCDC_CTRL6,
 					TFA9874_DCDC_CTRL6_DCVOS_MSK,
 					FIELD_PREP(TFA9874_DCDC_CTRL6_DCVOS_MSK, dcvos));
 		break;
@@ -252,6 +360,10 @@ static int tfa987x_i2c_probe(struct i2c_client *i2c)
 	if (IS_ERR(rmap))
 		return PTR_ERR(rmap);
 
+	ret = tfa987x_hardware_reset(dev);
+	if (ret)
+		return ret;
+
 	ret = regmap_read(rmap, TFA987X_REV, &rev);
 	if (ret < 0) {
 		dev_err(dev, "Failed to read revision register: %d\n", ret);
@@ -271,7 +383,16 @@ static int tfa987x_i2c_probe(struct i2c_client *i2c)
 	}
 
 	/* Perform soft reset */
-	regmap_write(rmap, TFA987X_SYS_CTRL0, TFA987X_SYS_CTRL0_I2CR_MSK);
+	ret = regmap_write(rmap, TFA987X_SYS_CTRL0, TFA987X_SYS_CTRL0_I2CR_MSK);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to perform soft reset\n");
+
+	if (device_property_read_bool(dev, "nxp,apply-revision-config")) {
+		ret = tfa9874_apply_revision_config(dev, rmap, rev);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to apply revision configuration\n");
+	}
 
 	/* Setup DC-DC Converter if we have configuration */
 	regmap_update_bits(rmap, TFA987X_SYS_CTRL0, TFA987X_SYS_CTRL0_DCDC_MSK,
@@ -319,17 +440,25 @@ static int tfa987x_i2c_probe(struct i2c_client *i2c)
 				 TFA987X_SYS_CTRL1_MANSCONF_MSK,
 				 TFA987X_SYS_CTRL1_MANSCONF_MSK);
 
-	/* spk-vol: 记录上电后默认增益/DCDC，便于评估「Speaker Volume」量程与是否需要 boost。 */
+	/*
+	 * spk-state: 记录默认增益、状态和 DCDC，比较安全版与音频实验版。
+	 */
 	{
 		unsigned int ampcfg = 0, tdm8 = 0, dcdc0 = 0;
+		unsigned int status0 = 0, status1 = 0, tdm3 = 0, dcdc6 = 0;
 
 		regmap_read(rmap, TFA987X_AMP_CFG, &ampcfg);
 		regmap_read(rmap, TFA987X_TDM_CFG8, &tdm8);
 		regmap_read(rmap, TFA987X_DCDC_CTRL0, &dcdc0);
+		regmap_read(rmap, TFA987X_STATUS_FLAGS0, &status0);
+		regmap_read(rmap, TFA987X_STATUS_FLAGS1, &status1);
+		regmap_read(rmap, TFA987X_TDM_CFG3, &tdm3);
+		regmap_read(rmap, TFA987X_DCDC_CTRL6, &dcdc6);
 		dev_info(dev,
-			 "spk-vol: init rev=0x%04x AMP_CFG=0x%04x gain=%lu TDM_CFG8=0x%04x SPKG=%lu DCDC_CTRL0=0x%04x(boost=%s)\n",
-			 rev, ampcfg, FIELD_GET(TFA987X_AMP_CFG_GAIN_MSK, ampcfg),
-			 tdm8, FIELD_GET(TFA987X_TDM_CFG8_SPKG_MSK, tdm8), dcdc0,
+			 "spk-state: init rev=0x%04x STATUS=0x%04x/0x%04x TDM3=0x%04x TDM8=0x%04x SPKG=%lu AMP=0x%04x gain=%lu DCDC0=0x%04x DCDC6=0x%04x boost=%s\n",
+			 rev, status0, status1, tdm3, tdm8,
+			 FIELD_GET(TFA987X_TDM_CFG8_SPKG_MSK, tdm8), ampcfg,
+			 FIELD_GET(TFA987X_AMP_CFG_GAIN_MSK, ampcfg), dcdc0, dcdc6,
 			 (dcdc0 & TFA987X_DCDC_CTRL0_DCIE_MSK) ? "on" : "off");
 	}
 

@@ -3815,6 +3815,69 @@
 			};
 		};
 
+		venus: video-codec@aa00000 {
+			compatible = "qcom,sm8150-venus";
+			reg = <0 0x0aa00000 0 0x200000>;
+			interrupts = <GIC_SPI 174 IRQ_TYPE_LEVEL_HIGH>;
+
+			clocks = <&gcc GCC_VIDEO_AXI0_CLK>,
+				 <&videocc VIDEO_CC_MVSC_CORE_CLK>,
+				 <&videocc VIDEO_CC_MVS0_CORE_CLK>;
+			clock-names = "iface", "core", "vcodec0_core";
+
+			power-domains = <&videocc VENUS_GDSC>,
+					<&videocc VCODEC0_GDSC>,
+					<&rpmhpd SM8150_MMCX>;
+			power-domain-names = "venus", "vcodec0", "mx";
+			operating-points-v2 = <&venus_opp_table>;
+
+			interconnects = <&gem_noc MASTER_AMPSS_M0 0
+					 &config_noc SLAVE_VENUS_CFG 0>,
+					<&mmss_noc MASTER_VIDEO_P0 0
+					 &mc_virt SLAVE_EBI_CH0 0>;
+			interconnect-names = "cpu-cfg", "video-mem";
+
+			iommus = <&apps_smmu 0x1300 0x60>;
+			memory-region = <&venus_mem>;
+
+			resets = <&gcc GCC_VIDEO_AXIC_CLK_BCR>,
+				 <&videocc VIDEO_CC_MVSC_CORE_CLK_BCR>,
+				 <&gcc GCC_VIDEO_AXI0_CLK_BCR>,
+				 <&gcc GCC_VIDEO_AXI1_CLK_BCR>;
+			reset-names = "bus", "core", "bus0", "bus1";
+
+			status = "disabled";
+
+			venus_opp_table: opp-table {
+				compatible = "operating-points-v2";
+
+				opp-200000000 {
+					opp-hz = /bits/ 64 <200000000>;
+					required-opps = <&rpmhpd_opp_low_svs>;
+				};
+
+				opp-240000000 {
+					opp-hz = /bits/ 64 <240000000>;
+					required-opps = <&rpmhpd_opp_svs>;
+				};
+
+				opp-338000000 {
+					opp-hz = /bits/ 64 <338000000>;
+					required-opps = <&rpmhpd_opp_svs_l1>;
+				};
+
+				opp-365000000 {
+					opp-hz = /bits/ 64 <365000000>;
+					required-opps = <&rpmhpd_opp_nom>;
+				};
+
+				opp-444000000 {
+					opp-hz = /bits/ 64 <444000000>;
+					required-opps = <&rpmhpd_opp_nom_l1>;
+				};
+			};
+		};
+
 		videocc: clock-controller@ab00000 {
 			compatible = "qcom,sm8150-videocc";
 			reg = <0 0x0ab00000 0 0x10000>;
