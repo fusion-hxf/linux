@@ -268,6 +268,11 @@ int venus_boot(struct venus_core *core)
 		 * cp_nonpixel_start = venus_sec_non_pixel/virtual-addr-pool[0]
 		 * cp_nonpixel_size = venus_sec_non_pixel/virtual-addr-pool[1]
 		 */
+		dev_info(dev,
+			 "configuring secure video ranges: cp=%#x+%#x nonpixel=%#x+%#x\n",
+			 res->cp_start, res->cp_size, res->cp_nonpixel_start,
+			 res->cp_nonpixel_size);
+
 		ret = qcom_scm_mem_protect_video_var(res->cp_start,
 						     res->cp_size,
 						     res->cp_nonpixel_start,
@@ -278,6 +283,8 @@ int venus_boot(struct venus_core *core)
 				ret);
 			return ret;
 		}
+
+		dev_info(dev, "secure video ranges configured\n");
 	}
 
 	return 0;
