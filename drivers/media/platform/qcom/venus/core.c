@@ -377,7 +377,9 @@ static void venus_remove_dynamic_nodes(struct venus_core *core) {}
 static int venus_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct resource *mem;
 	struct venus_core *core;
+	const char *stage = "allocate core";
 	int ret;
 
 	core = devm_kzalloc(dev, sizeof(*core), GFP_KERNEL);
@@ -386,38 +388,55 @@ static int venus_probe(struct platform_device *pdev)
 
 	core->dev = dev;
 
+	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!mem)
+		return dev_err_probe(dev, -ENODEV, "missing MMIO resource\n");
+
+	dev_info(dev, "probe start: MMIO %pr\n", mem);
+
 	core->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(core->base))
-		return PTR_ERR(core->base);
+		return dev_err_probe(dev, PTR_ERR(core->base),
+				     "failed to map MMIO %pr\n", mem);
 
 	core->video_path = devm_of_icc_get(dev, "video-mem");
 	if (IS_ERR(core->video_path))
-		return PTR_ERR(core->video_path);
+		return dev_err_probe(dev, PTR_ERR(core->video_path),
+				     "failed to get video-mem interconnect\n");
 
 	core->cpucfg_path = devm_of_icc_get(dev, "cpu-cfg");
 	if (IS_ERR(core->cpucfg_path))
-		return PTR_ERR(core->cpucfg_path);
+		return dev_err_probe(dev, PTR_ERR(core->cpucfg_path),
+				     "failed to get cpu-cfg interconnect\n");
 
 	core->irq = platform_get_irq(pdev, 0);
 	if (core->irq < 0)
-		return core->irq;
+		return dev_err_probe(dev, core->irq, "failed to get IRQ\n");
 
 	core->res = of_device_get_match_data(dev);
 	if (!core->res)
-		return -ENODEV;
+		return dev_err_probe(dev, -ENODEV, "missing match data\n");
+
+	dev_info(dev, "resources: HFI=%u VPU=%u IRQ=%d DMA mask=%#llx\n",
+		 core->res->hfi_version, core->res->vpu_version, core->irq,
+		 core->res->dma_mask);
 
 	mutex_init(&core->pm_lock);
 
 	core->pm_ops = venus_pm_get(core->res->hfi_version);
 	if (!core->pm_ops)
-		return -ENODEV;
+		return dev_err_probe(dev, -ENODEV,
+				     "missing PM ops for HFI %u\n",
+				     core->res->hfi_version);
 
 	if (core->pm_ops->core_get) {
 		ret = core->pm_ops->core_get(core);
 		if (ret)
-			return ret;
+			return dev_err_probe(dev, ret,
+					     "failed to acquire core resources\n");
 	}
 
+	stage = "configure DMA mask";
 	ret = dma_set_mask_and_coherent(dev, core->res->dma_mask);
 	if (ret)
 		goto err_core_put;
@@ -429,10 +448,12 @@ static int venus_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&core->work, venus_sys_error_handler);
 	init_waitqueue_head(&core->sys_err_done);
 
+	stage = "create HFI";
 	ret = hfi_create(core, &venus_core_ops);
 	if (ret)
 		goto err_core_put;
 
+	stage = "request IRQ";
 	ret = devm_request_threaded_irq(dev, core->irq, hfi_isr, venus_isr_thread,
 					IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
 					"venus", core);
@@ -441,6 +462,7 @@ static int venus_probe(struct platform_device *pdev)
 
 	venus_assign_register_offsets(core);
 
+	stage = "register V4L2 device";
 	ret = v4l2_device_register(dev, &core->v4l2_dev);
 	if (ret)
 		goto err_hfi_destroy;
@@ -449,52 +471,66 @@ static int venus_probe(struct platform_device *pdev)
 
 	pm_runtime_enable(dev);
 
+	stage = "enable runtime power";
 	ret = pm_runtime_get_sync(dev);
 	if (ret < 0)
 		goto err_runtime_disable;
 
+	dev_info(dev, "runtime power enabled, initializing firmware\n");
+
+	stage = "initialize firmware context";
 	ret = venus_firmware_init(core);
 	if (ret)
 		goto err_runtime_disable;
 
+	stage = "load and start firmware";
 	ret = venus_boot(core);
 	if (ret)
 		goto err_firmware_deinit;
 
+	stage = "configure firmware";
 	ret = venus_firmware_cfg(core);
 	if (ret)
 		goto err_venus_shutdown;
 
+	stage = "resume HFI core";
 	ret = hfi_core_resume(core, true);
 	if (ret)
 		goto err_venus_shutdown;
 
+	stage = "initialize HFI core";
 	ret = hfi_core_init(core);
 	if (ret)
 		goto err_venus_shutdown;
 
+	stage = "check firmware version";
 	ret = venus_firmware_check(core);
 	if (ret)
 		goto err_core_deinit;
 
 	if (core->res->dec_nodename || core->res->enc_nodename) {
+		stage = "add codec nodes";
 		ret = venus_add_dynamic_nodes(core);
 		if (ret)
 			goto err_core_deinit;
 	}
 
+	stage = "populate codec devices";
 	ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
 	if (ret)
 		goto err_remove_dynamic_nodes;
 
+	stage = "enumerate decoder codecs";
 	ret = venus_enumerate_codecs(core, VIDC_SESSION_TYPE_DEC);
 	if (ret)
 		goto err_of_depopulate;
 
+	stage = "enumerate encoder codecs";
 	ret = venus_enumerate_codecs(core, VIDC_SESSION_TYPE_ENC);
 	if (ret)
 		goto err_of_depopulate;
 
+	stage = "enter runtime idle";
 	ret = pm_runtime_put_sync(dev);
 	if (ret) {
 		pm_runtime_get_noresume(dev);
@@ -502,6 +538,9 @@ static int venus_probe(struct platform_device *pdev)
 	}
 
 	venus_dbgfs_init(core);
+	dev_info(dev, "probe complete: firmware v%u.%u.%u\n",
+		 core->venus_ver.major, core->venus_ver.minor,
+		 core->venus_ver.rev);
 
 	return 0;
 
@@ -523,6 +562,7 @@ err_runtime_disable:
 err_hfi_destroy:
 	hfi_destroy(core);
 err_core_put:
+	dev_err_probe(dev, ret, "probe failed at stage: %s\n", stage);
 	if (core->pm_ops->core_put)
 		core->pm_ops->core_put(core);
 	return ret;

@@ -112,9 +112,16 @@ static int venus_load_fw(struct venus_core *core, const char *fwname,
 	*mem_size = resource_size(&res);
 
 	if (*mem_size < fw_size || fw_size > VENUS_FW_MEM_SIZE) {
+		dev_err(dev,
+			"firmware %s size %zd does not fit reserved memory %#zx\n",
+			fwname, fw_size, *mem_size);
 		ret = -EINVAL;
 		goto err_release_fw;
 	}
+
+	dev_info(dev, "firmware %s: image=%zd reserved=%pa+%#zx mode=%s\n",
+		 fwname, fw_size, mem_phys, *mem_size,
+		 core->use_tz ? "trusted" : "non-secure");
 
 	mem_va = memremap(*mem_phys, *mem_size, MEMREMAP_WC);
 	if (!mem_va) {
@@ -228,7 +235,8 @@ int venus_boot(struct venus_core *core)
 
 	ret = venus_load_fw(core, fwpath, &mem_phys, &mem_size);
 	if (ret) {
-		dev_err(dev, "fail to load video firmware\n");
+		dev_err(dev, "failed to load video firmware %s (%d)\n",
+			fwpath, ret);
 		return -EINVAL;
 	}
 
@@ -240,8 +248,14 @@ int venus_boot(struct venus_core *core)
 	else
 		ret = venus_boot_no_tz(core, mem_phys, mem_size);
 
-	if (ret)
+	if (ret) {
+		dev_err(dev, "firmware start failed in %s mode (%d)\n",
+			core->use_tz ? "trusted" : "non-secure", ret);
 		return ret;
+	}
+
+	dev_info(dev, "firmware started in %s mode\n",
+		 core->use_tz ? "trusted" : "non-secure");
 
 	if (core->use_tz && res->cp_size) {
 		/*
