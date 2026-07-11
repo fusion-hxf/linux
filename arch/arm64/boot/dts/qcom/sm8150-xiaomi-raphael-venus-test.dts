@@ -5,6 +5,7 @@
 
 / {
 	model = "Xiaomi Redmi K20 Pro (Venus bring-up)";
+	compatible = "xiaomi,raphael-venus-test", "xiaomi,raphael", "qcom,sm8150";
 };
 
 &venus {
