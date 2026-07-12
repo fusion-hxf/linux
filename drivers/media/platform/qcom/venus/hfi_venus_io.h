@@ -25,6 +25,11 @@
 
 #define CPU_CS_A2HSOFTINTCLR			0x1c
 
+/* Relative to CPU_IC_BASE. */
+#define CPU_IC_IRQSTATUS			0x00
+#define CPU_IC_RAWINTR				0x08
+#define CPU_IC_INTENABLE			0x10
+
 /* Iris1 DSP queue and uncached-region registers, relative to CPU_CS_BASE. */
 #define HFI_DSP_QTBL_ADDR			0x34
 #define HFI_DSP_UC_REGION_ADDR			0x38

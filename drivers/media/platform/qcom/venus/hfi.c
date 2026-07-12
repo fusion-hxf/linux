@@ -64,6 +64,7 @@ int hfi_core_init(struct venus_core *core)
 
 	ret = wait_for_completion_timeout(&core->done, TIMEOUT);
 	if (!ret) {
+		venus_hfi_dump_status(core);
 		ret = -ETIMEDOUT;
 		goto unlock;
 	}

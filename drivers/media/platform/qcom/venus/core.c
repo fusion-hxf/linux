@@ -385,7 +385,8 @@ static int venus_probe(struct platform_device *pdev)
 	struct resource *mem;
 	struct venus_core *core;
 	const char *stage = "allocate core";
-	int ret;
+	bool runtime_powered = false;
+	int power_ret, icc_ret, ret;
 
 	core = devm_kzalloc(dev, sizeof(*core), GFP_KERNEL);
 	if (!core)
@@ -485,6 +486,7 @@ static int venus_probe(struct platform_device *pdev)
 	ret = pm_runtime_get_sync(dev);
 	if (ret < 0)
 		goto err_runtime_disable;
+	runtime_powered = true;
 
 	dev_info(dev, "runtime power enabled, initializing firmware\n");
 
@@ -565,6 +567,32 @@ err_venus_shutdown:
 err_firmware_deinit:
 	venus_firmware_deinit(core);
 err_runtime_disable:
+	/*
+	 * A failed HFI handshake cannot use the normal runtime suspend path:
+	 * it may wait for another firmware response.  Tear down the hardware
+	 * votes directly so a failed experimental probe cannot leave clocks or
+	 * GDSCs enabled and destabilize the next boot or probe attempt.
+	 */
+	if (runtime_powered) {
+		dev_info(dev, "probe cleanup: forcing runtime hardware off\n");
+		power_ret = 0;
+		if (core->pm_ops->core_power)
+			power_ret = core->pm_ops->core_power(core, POWER_OFF);
+		if (power_ret)
+			dev_warn(dev, "probe cleanup: core power-off failed (%d)\n",
+				 power_ret);
+	}
+
+	icc_ret = icc_set_bw(core->cpucfg_path, 0, 0);
+	if (icc_ret)
+		dev_warn(dev, "probe cleanup: cpu-cfg ICC failed (%d)\n",
+			 icc_ret);
+
+	icc_ret = icc_set_bw(core->video_path, 0, 0);
+	if (icc_ret)
+		dev_warn(dev, "probe cleanup: video-mem ICC failed (%d)\n",
+			 icc_ret);
+
 	pm_runtime_put_noidle(dev);
 	pm_runtime_disable(dev);
 	pm_runtime_set_suspended(dev);

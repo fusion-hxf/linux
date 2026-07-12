@@ -389,14 +389,25 @@ static void venus_set_registers(struct venus_hfi_device *hdev)
 
 static void venus_soft_int(struct venus_hfi_device *hdev)
 {
+	struct venus_core *core = hdev->core;
 	void __iomem *cpu_ic_base = hdev->core->cpu_ic_base;
 	u32 clear_bit;
 
-	if (IS_V6(hdev->core) || (IS_V4(hdev->core) && is_lite(hdev->core)))
+	/*
+	 * Iris1 speaks HFI 6xx but retains the legacy CPU interrupt
+	 * controller.  Its host-to-firmware doorbell is bit 15, not the bit 0
+	 * used by the V6 register layout on Iris2.
+	 */
+	if (IS_IRIS1(core))
+		clear_bit = BIT(CPU_IC_SOFTINT_H2A_SHIFT);
+	else if (IS_V6(core) || (IS_V4(core) && is_lite(core)))
 		clear_bit = BIT(CPU_IC_SOFTINT_H2A_SHIFT_V6);
 	else
 		clear_bit = BIT(CPU_IC_SOFTINT_H2A_SHIFT);
 
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 HFI doorbell: value=%#x\n",
+			 clear_bit);
 	writel(clear_bit, cpu_ic_base + CPU_IC_SOFTINT);
 }
 
@@ -405,6 +416,7 @@ static int venus_iface_cmdq_write_nolock(struct venus_hfi_device *hdev,
 {
 	struct device *dev = hdev->core->dev;
 	struct hfi_pkt_hdr *cmd_packet;
+	struct iface_queue *cmd_queue;
 	struct iface_queue *queue;
 	u32 rx_req;
 	int ret;
@@ -416,6 +428,7 @@ static int venus_iface_cmdq_write_nolock(struct venus_hfi_device *hdev,
 	hdev->last_packet_type = cmd_packet->pkt_type;
 
 	queue = &hdev->queues[IFACEQ_CMD_IDX];
+	cmd_queue = queue;
 
 	ret = venus_write_queue(hdev, queue, pkt, &rx_req);
 	if (ret) {
@@ -433,6 +446,13 @@ static int venus_iface_cmdq_write_nolock(struct venus_hfi_device *hdev,
 		/* ensure rx_req is updated in memory */
 		wmb();
 	}
+
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev,
+			 "Iris1 cmdq: pkt=%#x size=%u rd=%u wr=%u rx-req=%u\n",
+			 cmd_packet->pkt_type, cmd_packet->size,
+			 cmd_queue->qhdr->read_idx, cmd_queue->qhdr->write_idx,
+			 rx_req);
 
 	if (rx_req)
 		venus_soft_int(hdev);
@@ -1147,6 +1167,9 @@ static irqreturn_t venus_isr_thread(struct venus_core *core)
 
 	while (!venus_iface_msgq_read(hdev, pkt)) {
 		msg_ret = hfi_process_msg_packet(core, pkt);
+		if (IS_IRIS1(core))
+			dev_info(core->dev, "Iris1 HFI message: type=%#x\n",
+				 msg_ret);
 		switch (msg_ret) {
 		case HFI_MSG_EVENT_NOTIFY:
 			venus_process_msg_sys_error(hdev, pkt);
@@ -1187,6 +1210,8 @@ static irqreturn_t venus_isr(struct venus_core *core)
 	wrapper_base = hdev->core->wrapper_base;
 
 	status = readl(wrapper_base + WRAPPER_INTR_STATUS);
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 HFI IRQ: status=%#x\n", status);
 
 	if (IS_AR50_LITE(core)) {
 		if (status & WRAPPER_INTR_STATUS_A2H_MASK ||
@@ -1209,6 +1234,43 @@ static irqreturn_t venus_isr(struct venus_core *core)
 		writel(status, wrapper_base + WRAPPER_INTR_CLEAR);
 
 	return IRQ_WAKE_THREAD;
+}
+
+void venus_hfi_dump_status(struct venus_core *core)
+{
+	struct venus_hfi_device *hdev = to_hfi_priv(core);
+	struct hfi_queue_header *cmdq, *msgq, *dbgq;
+	void __iomem *cpu_ic_base;
+	void __iomem *wrapper_base;
+
+	if (!IS_IRIS1(core) || !hdev)
+		return;
+
+	cpu_ic_base = core->cpu_ic_base;
+	wrapper_base = core->wrapper_base;
+
+	mutex_lock(&hdev->lock);
+	cmdq = hdev->queues[IFACEQ_CMD_IDX].qhdr;
+	msgq = hdev->queues[IFACEQ_MSG_IDX].qhdr;
+	dbgq = hdev->queues[IFACEQ_DBG_IDX].qhdr;
+
+	dev_err(core->dev,
+		"Iris1 HFI timeout: last-pkt=%#x irq-seen=%#x intr-status=%#x intr-mask=%#x cpu-irq=%#x cpu-raw=%#x cpu-enable=%#x\n",
+		hdev->last_packet_type, hdev->irq_status,
+		readl(wrapper_base + WRAPPER_INTR_STATUS),
+		readl(wrapper_base + WRAPPER_INTR_MASK),
+		readl(cpu_ic_base + CPU_IC_IRQSTATUS),
+		readl(cpu_ic_base + CPU_IC_RAWINTR),
+		readl(cpu_ic_base + CPU_IC_INTENABLE));
+
+	if (cmdq && msgq && dbgq)
+		dev_err(core->dev,
+			"Iris1 HFI queues: cmd=%u/%u rx=%u tx=%u msg=%u/%u rx=%u tx=%u dbg=%u/%u\n",
+			cmdq->read_idx, cmdq->write_idx, cmdq->rx_req,
+			cmdq->tx_req, msgq->read_idx, msgq->write_idx,
+			msgq->rx_req, msgq->tx_req, dbgq->read_idx,
+			dbgq->write_idx);
+	mutex_unlock(&hdev->lock);
 }
 
 static int venus_core_init(struct venus_core *core)
