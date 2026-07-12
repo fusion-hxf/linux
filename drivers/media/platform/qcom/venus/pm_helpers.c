@@ -23,6 +23,16 @@
 
 static bool legacy_binding;
 
+static void iris1_resource_checkpoint(struct venus_core *core,
+				      const char *stage)
+{
+	if (!IS_IRIS1(core))
+		return;
+
+	dev_info(core->dev, "Iris1 resource checkpoint: %s\n", stage);
+	msleep(100);
+}
+
 static int core_clks_get(struct venus_core *core)
 {
 	const struct venus_resources *res = core->res;
@@ -1010,39 +1020,52 @@ static int core_get_v4(struct venus_core *core)
 	unsigned int i;
 	int ret;
 
+	iris1_resource_checkpoint(core, "core clocks get start");
 	ret = core_clks_get(core);
 	if (ret)
 		return ret;
+	iris1_resource_checkpoint(core, "core clocks get done");
 
 	if (!res->vcodec_pmdomains_num)
 		legacy_binding = true;
 
 	dev_info(dev, "%s legacy binding\n", legacy_binding ? "" : "non");
 
+	iris1_resource_checkpoint(core, "vcodec0 clocks get start");
 	ret = vcodec_clks_get(core, dev, core->vcodec0_clks, res->vcodec0_clks);
 	if (ret)
 		return ret;
+	iris1_resource_checkpoint(core, "vcodec0 clocks get done");
 
+	iris1_resource_checkpoint(core, "vcodec1 clocks get start");
 	ret = vcodec_clks_get(core, dev, core->vcodec1_clks, res->vcodec1_clks);
 	if (ret)
 		return ret;
+	iris1_resource_checkpoint(core, "vcodec1 clocks get done");
 
+	iris1_resource_checkpoint(core, "resets get start");
 	ret = core_resets_get(core);
 	if (ret)
 		return ret;
+	iris1_resource_checkpoint(core, "resets get done");
 
 	if (legacy_binding)
 		return 0;
 
+	iris1_resource_checkpoint(core, "OPP clock setup start");
 	ret = devm_pm_opp_set_clkname(dev, "core");
 	if (ret)
 		return ret;
+	iris1_resource_checkpoint(core, "OPP clock setup done");
 
+	iris1_resource_checkpoint(core, "power-domain attach start");
 	ret = vcodec_domains_get(core);
 	if (ret)
 		return ret;
+	iris1_resource_checkpoint(core, "power-domain attach done");
 
 	if (core->res->opp_pmdomain) {
+		iris1_resource_checkpoint(core, "OPP table add start");
 		ret = devm_pm_opp_of_add_table(dev);
 		if (ret) {
 			if (ret == -ENODEV) {
@@ -1056,6 +1079,7 @@ static int core_get_v4(struct venus_core *core)
 				return ret;
 			}
 		}
+		iris1_resource_checkpoint(core, "OPP table add done");
 	}
 
 	return 0;

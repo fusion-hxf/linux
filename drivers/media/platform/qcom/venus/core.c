@@ -33,6 +33,16 @@ module_param(allow_iris1_probe, bool, 0400);
 MODULE_PARM_DESC(allow_iris1_probe,
 		 "Allow explicit probe of experimental Iris1 hardware");
 
+static void venus_iris1_checkpoint(struct venus_core *core, const char *stage)
+{
+	if (!IS_IRIS1(core))
+		return;
+
+	dev_info(core->dev, "Iris1 probe checkpoint: %s\n", stage);
+	/* Let the persistent userspace kmsg logger commit this breadcrumb. */
+	msleep(100);
+}
+
 static void venus_coredump(struct venus_core *core)
 {
 	struct device *dev;
@@ -441,18 +451,22 @@ static int venus_probe(struct platform_device *pdev)
 				     core->res->hfi_version);
 
 	if (core->pm_ops->core_get) {
+		venus_iris1_checkpoint(core, "core resources get start");
 		ret = core->pm_ops->core_get(core);
 		if (ret)
 			return dev_err_probe(dev, ret,
 					     "failed to acquire core resources\n");
+		venus_iris1_checkpoint(core, "core resources get done");
 	}
 
 	stage = "configure DMA mask";
+	venus_iris1_checkpoint(core, "DMA configuration start");
 	ret = dma_set_mask_and_coherent(dev, core->res->dma_mask);
 	if (ret)
 		goto err_core_put;
 
 	dma_set_max_seg_size(dev, UINT_MAX);
+	venus_iris1_checkpoint(core, "DMA configuration done");
 
 	INIT_LIST_HEAD(&core->instances);
 	mutex_init(&core->lock);
@@ -460,29 +474,36 @@ static int venus_probe(struct platform_device *pdev)
 	init_waitqueue_head(&core->sys_err_done);
 
 	stage = "create HFI";
+	venus_iris1_checkpoint(core, "HFI queue allocation start");
 	ret = hfi_create(core, &venus_core_ops);
 	if (ret)
 		goto err_core_put;
+	venus_iris1_checkpoint(core, "HFI queue allocation done");
 
 	stage = "request IRQ";
+	venus_iris1_checkpoint(core, "IRQ request start");
 	ret = devm_request_threaded_irq(dev, core->irq, hfi_isr, venus_isr_thread,
 					IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
 					"venus", core);
 	if (ret)
 		goto err_core_put;
+	venus_iris1_checkpoint(core, "IRQ request done");
 
 	venus_assign_register_offsets(core);
 
 	stage = "register V4L2 device";
+	venus_iris1_checkpoint(core, "V4L2 registration start");
 	ret = v4l2_device_register(dev, &core->v4l2_dev);
 	if (ret)
 		goto err_hfi_destroy;
+	venus_iris1_checkpoint(core, "V4L2 registration done");
 
 	platform_set_drvdata(pdev, core);
 
 	pm_runtime_enable(dev);
 
 	stage = "enable runtime power";
+	venus_iris1_checkpoint(core, "runtime PM get start");
 	ret = pm_runtime_get_sync(dev);
 	if (ret < 0)
 		goto err_runtime_disable;
@@ -713,21 +734,32 @@ static __maybe_unused int venus_runtime_resume(struct device *dev)
 	const struct venus_pm_ops *pm_ops = core->pm_ops;
 	int ret;
 
+	venus_iris1_checkpoint(core, "video-mem ICC vote start");
 	ret = icc_set_bw(core->video_path, kbps_to_icc(20000), 0);
 	if (ret)
 		return ret;
+	venus_iris1_checkpoint(core, "video-mem ICC vote done");
 
+	venus_iris1_checkpoint(core, "cpu-cfg ICC vote start");
 	ret = icc_set_bw(core->cpucfg_path, kbps_to_icc(1000), 0);
 	if (ret)
 		return ret;
+	venus_iris1_checkpoint(core, "cpu-cfg ICC vote done");
 
 	if (pm_ops->core_power) {
+		venus_iris1_checkpoint(core, "core power-on callback start");
 		ret = pm_ops->core_power(core, POWER_ON);
 		if (ret)
 			return ret;
+		venus_iris1_checkpoint(core, "core power-on callback done");
 	}
 
-	return hfi_core_resume(core, false);
+	venus_iris1_checkpoint(core, "HFI runtime resume start");
+	ret = hfi_core_resume(core, false);
+	if (!ret)
+		venus_iris1_checkpoint(core, "HFI runtime resume done");
+
+	return ret;
 }
 
 static const struct dev_pm_ops venus_pm_ops = {

@@ -4,6 +4,7 @@
  */
 
 #include <linux/device.h>
+#include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/kernel.h>
 #include <linux/iommu.h>
@@ -23,6 +24,15 @@
 #define VENUS_PAS_ID			9
 #define VENUS_FW_MEM_SIZE		(6 * SZ_1M)
 #define VENUS_FW_START_ADDR		0x0
+
+static void venus_fw_checkpoint(struct venus_core *core, const char *stage)
+{
+	if (!IS_IRIS1(core))
+		return;
+
+	dev_info(core->dev, "Iris1 firmware checkpoint: %s\n", stage);
+	msleep(100);
+}
 
 static void venus_reset_cpu(struct venus_core *core)
 {
@@ -92,21 +102,27 @@ static int venus_load_fw(struct venus_core *core, const char *fwname,
 	*mem_size = 0;
 
 	dev = core->dev;
+	venus_fw_checkpoint(core, "reserved-memory lookup start");
 	ret = of_reserved_mem_region_to_resource(dev->of_node, 0, &res);
 	if (ret) {
 		dev_err(dev, "failed to lookup reserved memory-region\n");
 		return -EINVAL;
 	}
+	venus_fw_checkpoint(core, "reserved-memory lookup done");
 
+	venus_fw_checkpoint(core, "request_firmware start");
 	ret = request_firmware(&mdt, fwname, dev);
 	if (ret < 0)
 		return ret;
+	venus_fw_checkpoint(core, "request_firmware done");
 
+	venus_fw_checkpoint(core, "MDT size read start");
 	fw_size = qcom_mdt_get_size(mdt);
 	if (fw_size < 0) {
 		ret = fw_size;
 		goto err_release_fw;
 	}
+	venus_fw_checkpoint(core, "MDT size read done");
 
 	*mem_phys = res.start;
 	*mem_size = resource_size(&res);
@@ -123,19 +139,24 @@ static int venus_load_fw(struct venus_core *core, const char *fwname,
 		 fwname, fw_size, mem_phys, *mem_size,
 		 core->use_tz ? "trusted" : "non-secure");
 
+	venus_fw_checkpoint(core, "reserved-memory memremap start");
 	mem_va = memremap(*mem_phys, *mem_size, MEMREMAP_WC);
 	if (!mem_va) {
 		dev_err(dev, "unable to map memory region %pa size %#zx\n", mem_phys, *mem_size);
 		ret = -ENOMEM;
 		goto err_release_fw;
 	}
+	venus_fw_checkpoint(core, "reserved-memory memremap done");
 
+	venus_fw_checkpoint(core, "qcom_mdt_load start");
 	if (core->use_tz)
 		ret = qcom_mdt_load(dev, mdt, fwname, VENUS_PAS_ID,
 				    mem_va, *mem_phys, *mem_size, NULL);
 	else
 		ret = qcom_mdt_load_no_init(dev, mdt, fwname, mem_va,
 					    *mem_phys, *mem_size, NULL);
+	if (!ret)
+		venus_fw_checkpoint(core, "qcom_mdt_load done");
 
 	memunmap(mem_va);
 err_release_fw:
@@ -243,10 +264,14 @@ int venus_boot(struct venus_core *core)
 	core->fw.mem_size = mem_size;
 	core->fw.mem_phys = mem_phys;
 
-	if (core->use_tz)
+	if (core->use_tz) {
+		venus_fw_checkpoint(core, "PAS auth-and-reset start");
 		ret = qcom_scm_pas_auth_and_reset(VENUS_PAS_ID);
-	else
+		if (!ret)
+			venus_fw_checkpoint(core, "PAS auth-and-reset done");
+	} else {
 		ret = venus_boot_no_tz(core, mem_phys, mem_size);
+	}
 
 	if (ret) {
 		dev_err(dev, "firmware start failed in %s mode (%d)\n",
