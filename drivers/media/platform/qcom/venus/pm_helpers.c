@@ -11,7 +11,6 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_runtime.h>
-#include <linux/printk.h>
 #include <linux/reset.h>
 #include <linux/types.h>
 #include <media/v4l2-mem2mem.h>
@@ -72,7 +71,6 @@ static int core_clks_enable(struct venus_core *core)
 		if (IS_IRIS1(core)) {
 			dev_info(dev, "Iris1 clock %s: prepare-enable start\n",
 				 res->clks[i]);
-			pr_flush(1000, true);
 		}
 		ret = clk_prepare_enable(core->clks[i]);
 		if (ret)
@@ -942,7 +940,6 @@ static int core_resets_reset(struct venus_core *core)
 		for (i = 0; i < res->resets_num; i++) {
 			dev_info(core->dev, "Iris1 reset %s: assert\n",
 				 res->resets[i]);
-			pr_flush(1000, true);
 			ret = reset_control_assert(core->resets[i]);
 			if (ret)
 				goto err_deassert;
@@ -953,7 +950,6 @@ static int core_resets_reset(struct venus_core *core)
 		for (i = 0; i < res->resets_num; i++) {
 			dev_info(core->dev, "Iris1 reset %s: deassert\n",
 				 res->resets[i]);
-			pr_flush(1000, true);
 			ret = reset_control_deassert(core->resets[i]);
 			if (ret)
 				return ret;
@@ -1083,7 +1079,6 @@ static int core_power_v4(struct venus_core *core, int on)
 		if (pmctrl) {
 			if (IS_IRIS1(core)) {
 				dev_info(dev, "Iris1 power-on: enabling venus_gdsc\n");
-				pr_flush(1000, true);
 			}
 			ret = pm_runtime_resume_and_get(pmctrl);
 			if (ret < 0)
@@ -1103,7 +1098,6 @@ static int core_power_v4(struct venus_core *core, int on)
 			}
 
 			dev_info(dev, "Iris1 power-on: enabling vcodec0_gdsc\n");
-			pr_flush(1000, true);
 			ret = pm_runtime_resume_and_get(vcodec0);
 			if (ret < 0)
 				goto err_pmctrl;
@@ -1123,7 +1117,6 @@ static int core_power_v4(struct venus_core *core, int on)
 
 		if (IS_IRIS1(core)) {
 			dev_info(dev, "Iris1 power-on: enabling vcodec0 core clock\n");
-			pr_flush(1000, true);
 			ret = vcodec_clks_enable(core, core->vcodec0_clks);
 			if (ret)
 				goto err_core_clks;
