@@ -33,6 +33,16 @@ module_param(allow_iris1_probe, bool, 0400);
 MODULE_PARM_DESC(allow_iris1_probe,
 		 "Allow explicit probe of experimental Iris1 hardware");
 
+/*
+ * Stop points after venus_boot() has completed successfully.
+ * 0: full probe, 1: firmware boot, 2: firmware cfg,
+ * 3: HFI resume/venus_run, 4: HFI SYS_INIT handshake.
+ */
+static unsigned int iris1_probe_stage;
+module_param(iris1_probe_stage, uint, 0400);
+MODULE_PARM_DESC(iris1_probe_stage,
+		 "Iris1 probe stage: 0=full, 1=boot-stop, 2=cfg-stop, 3=resume-stop, 4=init-stop");
+
 static void venus_iris1_checkpoint(struct venus_core *core, const char *stage)
 {
 	if (!IS_IRIS1(core))
@@ -41,6 +51,18 @@ static void venus_iris1_checkpoint(struct venus_core *core, const char *stage)
 	dev_info(core->dev, "Iris1 probe checkpoint: %s\n", stage);
 	/* Let the persistent userspace kmsg logger commit this breadcrumb. */
 	msleep(100);
+}
+
+static int venus_iris1_shutdown_stop(struct venus_core *core,
+				     const char *stage)
+{
+	int ret;
+
+	ret = venus_shutdown(core);
+	dev_info(core->dev, "Iris1 %s: firmware shutdown ret=%d\n", stage, ret);
+	venus_iris1_checkpoint(core, stage);
+
+	return ret ?: -ECANCELED;
 }
 
 static void venus_coredump(struct venus_core *core)
@@ -413,6 +435,11 @@ static int venus_probe(struct platform_device *pdev)
 		return -EPERM;
 	}
 
+	if (IS_IRIS1(core) && iris1_probe_stage > 4)
+		return dev_err_probe(dev, -EINVAL,
+				     "invalid Iris1 probe stage %u\n",
+				     iris1_probe_stage);
+
 	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!mem)
 		return dev_err_probe(dev, -ENODEV, "missing MMIO resource\n");
@@ -521,20 +548,53 @@ static int venus_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_firmware_deinit;
 
+	if (IS_IRIS1(core) && iris1_probe_stage == 1) {
+		ret = venus_iris1_shutdown_stop(core, "boot-stop committed");
+		goto err_firmware_deinit;
+	}
+
 	stage = "configure firmware";
+	if (IS_IRIS1(core))
+		dev_info(dev, "Iris1 firmware cfg start\n");
 	ret = venus_firmware_cfg(core);
 	if (ret)
 		goto err_venus_shutdown;
+	if (IS_IRIS1(core))
+		dev_info(dev, "Iris1 firmware cfg done\n");
+
+	if (IS_IRIS1(core) && iris1_probe_stage == 2) {
+		ret = venus_iris1_shutdown_stop(core, "cfg-stop committed");
+		goto err_firmware_deinit;
+	}
 
 	stage = "resume HFI core";
+	if (IS_IRIS1(core))
+		dev_info(dev, "Iris1 HFI core resume start\n");
 	ret = hfi_core_resume(core, true);
 	if (ret)
 		goto err_venus_shutdown;
 
+	if (IS_IRIS1(core) && iris1_probe_stage == 3) {
+		ret = venus_iris1_shutdown_stop(core, "resume-stop committed");
+		goto err_firmware_deinit;
+	}
+	if (IS_IRIS1(core))
+		dev_info(dev, "Iris1 HFI core resume done\n");
+
 	stage = "initialize HFI core";
+	if (IS_IRIS1(core))
+		dev_info(dev, "Iris1 HFI core init start\n");
 	ret = hfi_core_init(core);
 	if (ret)
 		goto err_venus_shutdown;
+
+	if (IS_IRIS1(core) && iris1_probe_stage == 4) {
+		hfi_core_deinit(core, false);
+		ret = venus_iris1_shutdown_stop(core, "init-stop committed");
+		goto err_firmware_deinit;
+	}
+	if (IS_IRIS1(core))
+		dev_info(dev, "Iris1 HFI core init done\n");
 
 	stage = "check firmware version";
 	ret = venus_firmware_check(core);

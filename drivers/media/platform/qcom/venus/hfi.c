@@ -58,10 +58,14 @@ int hfi_core_init(struct venus_core *core)
 
 	reinit_completion(&core->done);
 
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 HFI init: sending core-init commands\n");
 	ret = core->ops->core_init(core);
 	if (ret)
 		goto unlock;
 
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 HFI init: waiting for SYS_INIT_DONE\n");
 	ret = wait_for_completion_timeout(&core->done, TIMEOUT);
 	if (!ret) {
 		venus_hfi_dump_status(core);
@@ -77,6 +81,8 @@ int hfi_core_init(struct venus_core *core)
 	}
 
 	core->state = CORE_INIT;
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 HFI init: SYS_INIT_DONE received\n");
 unlock:
 	mutex_unlock(&core->lock);
 	return ret;
@@ -128,10 +134,18 @@ int hfi_core_suspend(struct venus_core *core)
 
 int hfi_core_resume(struct venus_core *core, bool force)
 {
+	int ret;
+
 	if (!force && core->state != CORE_INIT)
 		return 0;
 
-	return core->ops->resume(core);
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 HFI resume: ops->resume start\n");
+	ret = core->ops->resume(core);
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 HFI resume: ops->resume ret=%d\n", ret);
+
+	return ret;
 }
 
 int hfi_core_trigger_ssr(struct venus_core *core, u32 type)

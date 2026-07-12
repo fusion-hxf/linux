@@ -38,11 +38,17 @@
  * 2: load the MDT image (including PAS init), but do not auth/reset it
  * 3: auth/reset and immediately shut the firmware down
  * 4: auth/reset, configure secure ranges and immediately shut it down
+ * 5: auth/reset, configure secure ranges, hold, then shut it down
  */
 static unsigned int iris1_fw_stage;
 module_param(iris1_fw_stage, uint, 0400);
 MODULE_PARM_DESC(iris1_fw_stage,
-		 "Iris1 firmware stage: 0=full, 1=map, 2=load, 3=auth-stop, 4=protect-stop");
+		 "Iris1 firmware stage: 0=full, 1=map, 2=load, 3=auth-stop, 4=protect-stop, 5=hold-stop");
+
+static unsigned int iris1_fw_hold_ms = 100;
+module_param(iris1_fw_hold_ms, uint, 0400);
+MODULE_PARM_DESC(iris1_fw_hold_ms,
+		 "Iris1 stage 5 runtime before immediate firmware shutdown");
 
 static unsigned int iris1_fw_checkpoint_ms = 1500;
 module_param(iris1_fw_checkpoint_ms, uint, 0400);
@@ -281,7 +287,7 @@ int venus_boot(struct venus_core *core)
 	int shutdown_ret, ret;
 
 	if (IS_IRIS1(core)) {
-		if (iris1_fw_stage > 4) {
+		if (iris1_fw_stage > 5) {
 			dev_err(dev, "invalid Iris1 firmware diagnostic stage %u\n",
 				iris1_fw_stage);
 			return -EINVAL;
@@ -380,6 +386,21 @@ int venus_boot(struct venus_core *core)
 				 div_u64(auth_ns, NSEC_PER_USEC),
 				 div_u64(protect_ns, NSEC_PER_USEC), shutdown_ret);
 			venus_fw_checkpoint(core, "protect-stop committed");
+			return shutdown_ret ?: -ECANCELED;
+		}
+
+		if (IS_IRIS1(core) && iris1_fw_stage == 5) {
+			unsigned int hold_ms = min(iris1_fw_hold_ms, 5000U);
+
+			dev_info(dev,
+				 "Iris1 hold-stop start: auth=%llu us protect=%llu us hold=%u ms\n",
+				 div_u64(auth_ns, NSEC_PER_USEC),
+				 div_u64(protect_ns, NSEC_PER_USEC), hold_ms);
+			msleep(hold_ms);
+			shutdown_ret = qcom_scm_pas_shutdown(VENUS_PAS_ID);
+			dev_info(dev, "Iris1 hold-stop done: shutdown_ret=%d\n",
+				 shutdown_ret);
+			venus_fw_checkpoint(core, "hold-stop committed");
 			return shutdown_ret ?: -ECANCELED;
 		}
 

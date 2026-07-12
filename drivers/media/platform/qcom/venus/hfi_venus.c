@@ -505,6 +505,9 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	void __iomem *wrapper_base = hdev->core->wrapper_base;
 	int ret = 0;
 
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev, "Iris1 boot-core: interrupt setup start\n");
+
 	if (IS_IRIS2(hdev->core) || IS_IRIS2_1(hdev->core)) {
 		mask_val = readl(wrapper_base + WRAPPER_INTR_MASK);
 		mask_val &= ~(WRAPPER_INTR_MASK_A2HWD_BASK_V6 |
@@ -524,6 +527,10 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	if (IS_V1(hdev->core))
 		writel(1, cpu_cs_base + CPU_CS_SCIACMDARG3);
 
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev,
+			 "Iris1 boot-core: write VIDC_CTRL_INIT=%#x, then poll SCIACMDARG0\n",
+			 BIT(VIDC_CTRL_INIT_CTRL_SHIFT));
 	writel(BIT(VIDC_CTRL_INIT_CTRL_SHIFT), cpu_cs_base + VIDC_CTRL_INIT);
 	while (!ctrl_status && count < max_tries) {
 		ctrl_status = readl(cpu_cs_base + CPU_CS_SCIACMDARG0);
@@ -594,7 +601,14 @@ static int venus_run(struct venus_hfi_device *hdev)
 	 * regulator_disable() and _enable()
 	 */
 	venus_set_registers(hdev);
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev, "Iris1 run: static register presets done\n");
 
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev,
+			 "Iris1 run: program UC region qtbl=%pad size=%#x sfr=%pad\n",
+			 &hdev->ifaceq_table.da, (u32)SHARED_QSIZE,
+			 &hdev->sfr.da);
 	writel(hdev->ifaceq_table.da, cpu_cs_base + UC_REGION_ADDR);
 	writel(SHARED_QSIZE, cpu_cs_base + UC_REGION_SIZE);
 	writel(hdev->ifaceq_table.da, cpu_cs_base + CPU_CS_SCIACMDARG2);
@@ -604,6 +618,7 @@ static int venus_run(struct venus_hfi_device *hdev)
 
 	/* Iris1 exposes an additional DSP view of the same HFI queues. */
 	if (IS_IRIS1(hdev->core)) {
+		dev_info(dev, "Iris1 run: program DSP queue view\n");
 		writel(hdev->ifaceq_table.da,
 		       cpu_cs_base + HFI_DSP_QTBL_ADDR);
 		writel(hdev->ifaceq_table.da,
@@ -620,6 +635,8 @@ static int venus_run(struct venus_hfi_device *hdev)
 	}
 
 	venus_hwversion(hdev);
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev, "Iris1 run: boot-core and hw-version read done\n");
 
 	return 0;
 }
@@ -729,18 +746,27 @@ static int venus_power_off(struct venus_hfi_device *hdev)
 
 static int venus_power_on(struct venus_hfi_device *hdev)
 {
+	struct device *dev = hdev->core->dev;
 	int ret;
 
 	if (hdev->power_enabled)
 		return 0;
 
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev, "Iris1 HFI power-on: remote-state resume start\n");
 	ret = venus_set_hw_state_resume(hdev->core);
 	if (ret)
 		goto err;
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev, "Iris1 HFI power-on: remote-state resume done\n");
 
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev, "Iris1 HFI power-on: venus_run start\n");
 	ret = venus_run(hdev);
 	if (ret)
 		goto err_suspend;
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev, "Iris1 HFI power-on: venus_run done\n");
 
 	hdev->power_enabled = true;
 
@@ -917,6 +943,14 @@ static int venus_interface_queues_init(struct venus_hfi_device *hdev)
 
 	/* ensure table and queue header structs are settled in memory */
 	wmb();
+	if (IS_IRIS1(hdev->core))
+		dev_info(hdev->core->dev,
+			 "Iris1 queue allocation: table=%pad/%#x cmd=%pad msg=%pad dbg=%pad sfr=%pad/%#x\n",
+			 &hdev->ifaceq_table.da, hdev->ifaceq_table.size,
+			 &hdev->queues[IFACEQ_CMD_IDX].qmem.da,
+			 &hdev->queues[IFACEQ_MSG_IDX].qmem.da,
+			 &hdev->queues[IFACEQ_DBG_IDX].qmem.da,
+			 &hdev->sfr.da, hdev->sfr.size);
 
 	return 0;
 }
@@ -1166,6 +1200,13 @@ static irqreturn_t venus_isr_thread(struct venus_core *core)
 
 
 	while (!venus_iface_msgq_read(hdev, pkt)) {
+		if (IS_IRIS1(core)) {
+			struct hfi_pkt_hdr *hdr = pkt;
+
+			dev_info(core->dev,
+				 "Iris1 HFI raw message: type=%#x size=%u\n",
+				 hdr->pkt_type, hdr->size);
+		}
 		msg_ret = hfi_process_msg_packet(core, pkt);
 		if (IS_IRIS1(core))
 			dev_info(core->dev, "Iris1 HFI message: type=%#x\n",
@@ -1282,6 +1323,9 @@ static int venus_core_init(struct venus_core *core)
 	int ret;
 
 	pkt_sys_init(&pkt, HFI_VIDEO_ARCH_OX);
+	if (IS_IRIS1(core))
+		dev_info(dev, "Iris1 core-init: SYS_INIT packet size=%u type=%#x\n",
+			 pkt.hdr.size, pkt.hdr.pkt_type);
 
 	venus_set_state(hdev, VENUS_STATE_INIT);
 
@@ -1290,6 +1334,10 @@ static int venus_core_init(struct venus_core *core)
 		return ret;
 
 	pkt_sys_image_version(&version_pkt);
+	if (IS_IRIS1(core))
+		dev_info(dev,
+			 "Iris1 core-init: IMAGE_VERSION packet size=%u type=%#x\n",
+			 version_pkt.hdr.size, version_pkt.hdr.pkt_type);
 
 	ret = venus_iface_cmdq_write(hdev, &version_pkt, false);
 	if (ret)
@@ -1298,6 +1346,9 @@ static int venus_core_init(struct venus_core *core)
 	ret = venus_sys_set_default_properties(hdev);
 	if (ret)
 		return ret;
+
+	if (IS_IRIS1(core))
+		dev_info(dev, "Iris1 core-init: default properties queued\n");
 
 	return 0;
 }
