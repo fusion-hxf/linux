@@ -188,7 +188,7 @@
 			ecc-size = <0>;
 			ftrace-size = <0>;
 			pmsg-size = <0x200000>;
-			record-size = <0>;
+			record-size = <0x200000>;
 			no-map;
 		};
 

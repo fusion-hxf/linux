@@ -11,6 +11,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_runtime.h>
+#include <linux/printk.h>
 #include <linux/reset.h>
 #include <linux/types.h>
 #include <media/v4l2-mem2mem.h>
@@ -60,21 +61,26 @@ static int core_clks_enable(struct venus_core *core)
 
 	for (i = 0; i < res->clks_num; i++) {
 		if (IS_V6(core) || (IS_V4(core) && is_lite(core))) {
+			if (IS_IRIS1(core))
+				dev_info(dev, "Iris1 clock %s: set-rate %lu\n",
+					 res->clks[i], freq);
 			ret = clk_set_rate(core->clks[i], freq);
 			if (ret)
 				goto err;
 		}
 
+		if (IS_IRIS1(core)) {
+			dev_info(dev, "Iris1 clock %s: prepare-enable start\n",
+				 res->clks[i]);
+			pr_flush(1000, true);
+		}
 		ret = clk_prepare_enable(core->clks[i]);
 		if (ret)
 			goto err;
-	}
 
-	if (IS_IRIS1(core)) {
-		for (i = 0; i < res->clks_num; i++)
-			dev_info(dev, "Iris1 clock %s enabled: rate=%lu\n",
-				 res->clks[i],
-				 clk_get_rate(core->clks[i]));
+		if (IS_IRIS1(core))
+			dev_info(dev, "Iris1 clock %s: enabled rate=%lu\n",
+				 res->clks[i], clk_get_rate(core->clks[i]));
 	}
 
 	return 0;
@@ -934,6 +940,9 @@ static int core_resets_reset(struct venus_core *core)
 	 */
 	if (IS_IRIS1(core)) {
 		for (i = 0; i < res->resets_num; i++) {
+			dev_info(core->dev, "Iris1 reset %s: assert\n",
+				 res->resets[i]);
+			pr_flush(1000, true);
 			ret = reset_control_assert(core->resets[i]);
 			if (ret)
 				goto err_deassert;
@@ -942,10 +951,14 @@ static int core_resets_reset(struct venus_core *core)
 		usleep_range(150, 250);
 
 		for (i = 0; i < res->resets_num; i++) {
+			dev_info(core->dev, "Iris1 reset %s: deassert\n",
+				 res->resets[i]);
+			pr_flush(1000, true);
 			ret = reset_control_deassert(core->resets[i]);
 			if (ret)
 				return ret;
 		}
+		dev_info(core->dev, "Iris1 bridge resets complete\n");
 
 		return 0;
 
@@ -1061,39 +1074,96 @@ static int core_power_v4(struct venus_core *core, int on)
 	struct device *dev = core->dev;
 	struct device *pmctrl = core->pmdomains ?
 			core->pmdomains->pd_devs[0] : NULL;
+	struct device *vcodec0 = core->pmdomains &&
+			core->res->vcodec_pmdomains_num > 1 ?
+			core->pmdomains->pd_devs[1] : NULL;
 	int ret = 0;
 
 	if (on == POWER_ON) {
 		if (pmctrl) {
-			ret = pm_runtime_resume_and_get(pmctrl);
-			if (ret < 0) {
-				return ret;
+			if (IS_IRIS1(core)) {
+				dev_info(dev, "Iris1 power-on: enabling venus_gdsc\n");
+				pr_flush(1000, true);
 			}
+			ret = pm_runtime_resume_and_get(pmctrl);
+			if (ret < 0)
+				return ret;
 		}
 
+		/*
+		 * Iris1's AXIC bridge reaches the MVS0 block as soon as its bus
+		 * clock is enabled.  Power the target domain before releasing the
+		 * bridge resets; otherwise the first transaction can stall the NoC.
+		 */
+		if (IS_IRIS1(core)) {
+			if (!vcodec0) {
+				ret = -ENODEV;
+				dev_err(dev, "Iris1 power-on: missing vcodec0_gdsc\n");
+				goto err_pmctrl;
+			}
+
+			dev_info(dev, "Iris1 power-on: enabling vcodec0_gdsc\n");
+			pr_flush(1000, true);
+			ret = pm_runtime_resume_and_get(vcodec0);
+			if (ret < 0)
+				goto err_pmctrl;
+		}
+
+		if (IS_IRIS1(core))
+			dev_info(dev, "Iris1 power-on: pulsing bridge resets\n");
 		ret = core_resets_reset(core);
-		if (ret) {
-			if (pmctrl)
-				pm_runtime_put_sync(pmctrl);
-			return ret;
-		}
+		if (ret)
+			goto err_vcodec_domain;
 
+		if (IS_IRIS1(core))
+			dev_info(dev, "Iris1 power-on: enabling bus/core/iface clocks\n");
 		ret = core_clks_enable(core);
-		if (ret < 0 && pmctrl)
-			pm_runtime_put_sync(pmctrl);
+		if (ret < 0)
+			goto err_vcodec_domain;
+
+		if (IS_IRIS1(core)) {
+			dev_info(dev, "Iris1 power-on: enabling vcodec0 core clock\n");
+			pr_flush(1000, true);
+			ret = vcodec_clks_enable(core, core->vcodec0_clks);
+			if (ret)
+				goto err_core_clks;
+
+			dev_info(dev, "Iris1 power-on complete: vcodec0 rate=%lu\n",
+				 clk_get_rate(core->vcodec0_clks[0]));
+		}
 	} else {
 		/* Drop the performance state vote */
 		if (core->opp_pmdomain)
 			dev_pm_opp_set_rate(dev, 0);
 
+		if (IS_IRIS1(core)) {
+			dev_info(dev, "Iris1 power-off: disabling vcodec0 clock\n");
+			vcodec_clks_disable(core, core->vcodec0_clks);
+		}
+
 		core_clks_disable(core);
 
 		ret = core_resets_reset(core);
+
+		if (IS_IRIS1(core) && vcodec0)
+			pm_runtime_put_sync(vcodec0);
 
 		if (pmctrl)
 			pm_runtime_put_sync(pmctrl);
 	}
 
+	return ret;
+
+err_core_clks:
+	core_clks_disable(core);
+err_vcodec_domain:
+	if (IS_IRIS1(core) && vcodec0)
+		pm_runtime_put_sync(vcodec0);
+err_pmctrl:
+	if (pmctrl)
+		pm_runtime_put_sync(pmctrl);
+
+	dev_err_probe(dev, ret, "Iris1 power-on failed\n");
 	return ret;
 }
 

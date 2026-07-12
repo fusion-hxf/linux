@@ -28,6 +28,11 @@
 #include "pm_helpers.h"
 #include "hfi_venus_io.h"
 
+static bool allow_iris1_probe;
+module_param(allow_iris1_probe, bool, 0400);
+MODULE_PARM_DESC(allow_iris1_probe,
+		 "Allow explicit probe of experimental Iris1 hardware");
+
 static void venus_coredump(struct venus_core *core)
 {
 	struct device *dev;
@@ -387,6 +392,15 @@ static int venus_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	core->dev = dev;
+	core->res = of_device_get_match_data(dev);
+	if (!core->res)
+		return dev_err_probe(dev, -ENODEV, "missing match data\n");
+
+	if (IS_IRIS1(core) && !allow_iris1_probe) {
+		dev_warn(dev,
+			 "Iris1 probe blocked by safety gate; load venus_core with allow_iris1_probe=1\n");
+		return -EPERM;
+	}
 
 	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!mem)
@@ -412,10 +426,6 @@ static int venus_probe(struct platform_device *pdev)
 	core->irq = platform_get_irq(pdev, 0);
 	if (core->irq < 0)
 		return dev_err_probe(dev, core->irq, "failed to get IRQ\n");
-
-	core->res = of_device_get_match_data(dev);
-	if (!core->res)
-		return dev_err_probe(dev, -ENODEV, "missing match data\n");
 
 	dev_info(dev, "resources: HFI=%u VPU=%u IRQ=%d DMA mask=%#llx\n",
 		 core->res->hfi_version, core->res->vpu_version, core->irq,
