@@ -7,6 +7,7 @@
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/iommu.h>
 #include <linux/io.h>
 #include <linux/of.h>
@@ -25,13 +26,32 @@
 #define VENUS_FW_MEM_SIZE		(6 * SZ_1M)
 #define VENUS_FW_START_ADDR		0x0
 
+/*
+ * Iris1 is still an experimental bring-up target.  Keep the diagnostic
+ * stages in the Venus module so one kernel build can distinguish a CPU
+ * mapping failure from an MDT/PAS load or firmware-start failure.
+ *
+ * 0: normal/full boot
+ * 1: map and unmap the reserved region, then stop the probe
+ * 2: load the MDT image (including PAS init), but do not auth/reset it
+ */
+static unsigned int iris1_fw_stage;
+module_param(iris1_fw_stage, uint, 0400);
+MODULE_PARM_DESC(iris1_fw_stage,
+		 "Iris1 firmware diagnostic stage: 0=full, 1=map-only, 2=load-only");
+
+static unsigned int iris1_fw_checkpoint_ms = 1500;
+module_param(iris1_fw_checkpoint_ms, uint, 0400);
+MODULE_PARM_DESC(iris1_fw_checkpoint_ms,
+		 "Delay after Iris1 firmware checkpoints for persistent logging");
+
 static void venus_fw_checkpoint(struct venus_core *core, const char *stage)
 {
 	if (!IS_IRIS1(core))
 		return;
 
 	dev_info(core->dev, "Iris1 firmware checkpoint: %s\n", stage);
-	msleep(100);
+	msleep(min(iris1_fw_checkpoint_ms, 5000U));
 }
 
 static void venus_reset_cpu(struct venus_core *core)
@@ -148,6 +168,15 @@ static int venus_load_fw(struct venus_core *core, const char *fwname,
 	}
 	venus_fw_checkpoint(core, "reserved-memory memremap done");
 
+	if (IS_IRIS1(core) && iris1_fw_stage == 1) {
+		dev_info(dev,
+			 "Iris1 diagnostic map-only stage complete; stopping probe safely\n");
+		venus_fw_checkpoint(core, "map-only stop committed");
+		memunmap(mem_va);
+		ret = -ECANCELED;
+		goto err_release_fw;
+	}
+
 	venus_fw_checkpoint(core, "qcom_mdt_load start");
 	if (core->use_tz)
 		ret = qcom_mdt_load(dev, mdt, fwname, VENUS_PAS_ID,
@@ -245,6 +274,19 @@ int venus_boot(struct venus_core *core)
 	size_t mem_size;
 	int ret;
 
+	if (IS_IRIS1(core)) {
+		if (iris1_fw_stage > 2) {
+			dev_err(dev, "invalid Iris1 firmware diagnostic stage %u\n",
+				iris1_fw_stage);
+			return -EINVAL;
+		}
+
+		dev_info(dev,
+			 "Iris1 firmware diagnostic configuration: stage=%u checkpoint_ms=%u\n",
+			 iris1_fw_stage, min(iris1_fw_checkpoint_ms, 5000U));
+		venus_fw_checkpoint(core, "diagnostic configuration committed");
+	}
+
 	if (!IS_ENABLED(CONFIG_QCOM_MDT_LOADER) ||
 	    (core->use_tz && !qcom_scm_is_available()))
 		return -EPROBE_DEFER;
@@ -263,6 +305,13 @@ int venus_boot(struct venus_core *core)
 
 	core->fw.mem_size = mem_size;
 	core->fw.mem_phys = mem_phys;
+
+	if (IS_IRIS1(core) && iris1_fw_stage == 2) {
+		dev_info(dev,
+			 "Iris1 diagnostic load-only stage complete; skipping PAS auth-and-reset\n");
+		venus_fw_checkpoint(core, "load-only stop committed");
+		return -ECANCELED;
+	}
 
 	if (core->use_tz) {
 		venus_fw_checkpoint(core, "PAS auth-and-reset start");
