@@ -7,6 +7,7 @@
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/iommu.h>
 #include <linux/io.h>
@@ -17,6 +18,7 @@
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/sizes.h>
 #include <linux/soc/qcom/mdt_loader.h>
+#include <linux/ktime.h>
 
 #include "core.h"
 #include "firmware.h"
@@ -34,11 +36,13 @@
  * 0: normal/full boot
  * 1: map and unmap the reserved region, then stop the probe
  * 2: load the MDT image (including PAS init), but do not auth/reset it
+ * 3: auth/reset and immediately shut the firmware down
+ * 4: auth/reset, configure secure ranges and immediately shut it down
  */
 static unsigned int iris1_fw_stage;
 module_param(iris1_fw_stage, uint, 0400);
 MODULE_PARM_DESC(iris1_fw_stage,
-		 "Iris1 firmware diagnostic stage: 0=full, 1=map-only, 2=load-only");
+		 "Iris1 firmware stage: 0=full, 1=map, 2=load, 3=auth-stop, 4=protect-stop");
 
 static unsigned int iris1_fw_checkpoint_ms = 1500;
 module_param(iris1_fw_checkpoint_ms, uint, 0400);
@@ -272,10 +276,12 @@ int venus_boot(struct venus_core *core)
 	const char *fwpath = NULL;
 	phys_addr_t mem_phys;
 	size_t mem_size;
-	int ret;
+	u64 auth_start = 0, auth_ns = 0;
+	u64 protect_start = 0, protect_ns = 0;
+	int shutdown_ret, ret;
 
 	if (IS_IRIS1(core)) {
-		if (iris1_fw_stage > 2) {
+		if (iris1_fw_stage > 4) {
 			dev_err(dev, "invalid Iris1 firmware diagnostic stage %u\n",
 				iris1_fw_stage);
 			return -EINVAL;
@@ -315,9 +321,9 @@ int venus_boot(struct venus_core *core)
 
 	if (core->use_tz) {
 		venus_fw_checkpoint(core, "PAS auth-and-reset start");
+		auth_start = ktime_get_ns();
 		ret = qcom_scm_pas_auth_and_reset(VENUS_PAS_ID);
-		if (!ret)
-			venus_fw_checkpoint(core, "PAS auth-and-reset done");
+		auth_ns = ktime_get_ns() - auth_start;
 	} else {
 		ret = venus_boot_no_tz(core, mem_phys, mem_size);
 	}
@@ -328,8 +334,20 @@ int venus_boot(struct venus_core *core)
 		return ret;
 	}
 
-	dev_info(dev, "firmware started in %s mode\n",
-		 core->use_tz ? "trusted" : "non-secure");
+	/*
+	 * Once PAS releases Iris1, the firmware can become a bus master.  Do not
+	 * put a logging delay between auth/reset and either shutdown or secure
+	 * range configuration: an unconfigured firmware was observed to wedge
+	 * the NoC within the old 1.5 second diagnostic delay.
+	 */
+	if (IS_IRIS1(core) && iris1_fw_stage == 3) {
+		shutdown_ret = qcom_scm_pas_shutdown(VENUS_PAS_ID);
+		dev_info(dev,
+			 "Iris1 auth-stop: auth=%llu us shutdown_ret=%d\n",
+			 div_u64(auth_ns, NSEC_PER_USEC), shutdown_ret);
+		venus_fw_checkpoint(core, "auth-stop committed");
+		return shutdown_ret ?: -ECANCELED;
+	}
 
 	if (core->use_tz && res->cp_size) {
 		/*
@@ -342,15 +360,12 @@ int venus_boot(struct venus_core *core)
 		 * cp_nonpixel_start = venus_sec_non_pixel/virtual-addr-pool[0]
 		 * cp_nonpixel_size = venus_sec_non_pixel/virtual-addr-pool[1]
 		 */
-		dev_info(dev,
-			 "configuring secure video ranges: cp=%#x+%#x nonpixel=%#x+%#x\n",
-			 res->cp_start, res->cp_size, res->cp_nonpixel_start,
-			 res->cp_nonpixel_size);
-
+		protect_start = ktime_get_ns();
 		ret = qcom_scm_mem_protect_video_var(res->cp_start,
 						     res->cp_size,
 						     res->cp_nonpixel_start,
 						     res->cp_nonpixel_size);
+		protect_ns = ktime_get_ns() - protect_start;
 		if (ret) {
 			qcom_scm_pas_shutdown(VENUS_PAS_ID);
 			dev_err(dev, "set virtual address ranges fail (%d)\n",
@@ -358,8 +373,26 @@ int venus_boot(struct venus_core *core)
 			return ret;
 		}
 
-		dev_info(dev, "secure video ranges configured\n");
+		if (IS_IRIS1(core) && iris1_fw_stage == 4) {
+			shutdown_ret = qcom_scm_pas_shutdown(VENUS_PAS_ID);
+			dev_info(dev,
+				 "Iris1 protect-stop: auth=%llu us protect=%llu us shutdown_ret=%d\n",
+				 div_u64(auth_ns, NSEC_PER_USEC),
+				 div_u64(protect_ns, NSEC_PER_USEC), shutdown_ret);
+			venus_fw_checkpoint(core, "protect-stop committed");
+			return shutdown_ret ?: -ECANCELED;
+		}
+
+		dev_info(dev,
+			 "secure video ranges configured: cp=%#x+%#x nonpixel=%#x+%#x (%llu us)\n",
+			 res->cp_start, res->cp_size, res->cp_nonpixel_start,
+			 res->cp_nonpixel_size,
+			 div_u64(protect_ns, NSEC_PER_USEC));
 	}
+
+	dev_info(dev, "firmware started in %s mode (auth %llu us)\n",
+		 core->use_tz ? "trusted" : "non-secure",
+		 div_u64(auth_ns, NSEC_PER_USEC));
 
 	return 0;
 }
