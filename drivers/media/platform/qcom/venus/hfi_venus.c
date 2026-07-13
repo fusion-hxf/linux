@@ -10,6 +10,7 @@
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/slab.h>
 
 #include "core.h"
@@ -134,6 +135,27 @@ int venus_fw_debug = HFI_DEBUG_MSG_ERROR | HFI_DEBUG_MSG_FATAL;
 static bool venus_fw_low_power_mode = true;
 static int venus_hw_rsp_timeout = 1000;
 static bool venus_fw_coverage;
+
+/*
+ * Stop points inside the Iris1 HFI resume sequence.  Returning -ECANCELED
+ * keeps the hardware powered until core.c has shut down PAS, then the probe
+ * cleanup path removes clocks and power-domain votes in the safe order.
+ */
+static unsigned int iris1_run_stage;
+module_param(iris1_run_stage, uint, 0400);
+MODULE_PARM_DESC(iris1_run_stage,
+		 "Iris1 stop: 0=full, 1=remote, 2=preset, 3=CPUQ, 4=DSPQ, 5=IRQ, 6=ready");
+
+static int venus_iris1_run_stop(struct venus_hfi_device *hdev,
+				unsigned int stage, const char *name)
+{
+	if (!IS_IRIS1(hdev->core) || iris1_run_stage != stage)
+		return 0;
+
+	dev_info(hdev->core->dev,
+		 "Iris1 run diagnostic stop: stage=%u (%s)\n", stage, name);
+	return -ECANCELED;
+}
 
 static void venus_set_state(struct venus_hfi_device *hdev,
 			    enum venus_state state)
@@ -524,6 +546,10 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	if (IS_IRIS1(hdev->core))
 		dev_info(dev, "Iris1 interrupts unmasked: mask=%#x\n", mask_val);
 
+	ret = venus_iris1_run_stop(hdev, 5, "interrupt setup");
+	if (ret)
+		return ret;
+
 	if (IS_V1(hdev->core))
 		writel(1, cpu_cs_base + CPU_CS_SCIACMDARG3);
 
@@ -532,6 +558,9 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 			 "Iris1 boot-core: write VIDC_CTRL_INIT=%#x, then poll SCIACMDARG0\n",
 			 BIT(VIDC_CTRL_INIT_CTRL_SHIFT));
 	writel(BIT(VIDC_CTRL_INIT_CTRL_SHIFT), cpu_cs_base + VIDC_CTRL_INIT);
+	if (IS_IRIS1(hdev->core))
+		dev_info(dev,
+			 "Iris1 boot-core: VIDC_CTRL_INIT write committed; polling status\n");
 	while (!ctrl_status && count < max_tries) {
 		ctrl_status = readl(cpu_cs_base + CPU_CS_SCIACMDARG0);
 		if ((ctrl_status & CPU_CS_SCIACMDARG0_ERROR_STATUS_MASK) == 4) {
@@ -560,6 +589,12 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	if (!ret && IS_IRIS1(hdev->core))
 		dev_info(dev, "Iris1 boot ready: status=%#x polls=%u\n",
 			 ctrl_status, count);
+
+	if (!ret) {
+		ret = venus_iris1_run_stop(hdev, 6, "boot ready");
+		if (ret)
+			return ret;
+	}
 
 	if (IS_IRIS2(hdev->core) || IS_IRIS2_1(hdev->core) || IS_AR50_LITE(hdev->core)) {
 		writel(0x1, cpu_cs_base + CPU_CS_H2XSOFTINTEN_V6);
@@ -604,6 +639,10 @@ static int venus_run(struct venus_hfi_device *hdev)
 	if (IS_IRIS1(hdev->core))
 		dev_info(dev, "Iris1 run: static register presets done\n");
 
+	ret = venus_iris1_run_stop(hdev, 2, "static register presets");
+	if (ret)
+		return ret;
+
 	if (IS_IRIS1(hdev->core))
 		dev_info(dev,
 			 "Iris1 run: program UC region qtbl=%pad size=%#x sfr=%pad\n",
@@ -616,6 +655,10 @@ static int venus_run(struct venus_hfi_device *hdev)
 	if (hdev->sfr.da)
 		writel(hdev->sfr.da, cpu_cs_base + SFR_ADDR);
 
+	ret = venus_iris1_run_stop(hdev, 3, "CPU queue view");
+	if (ret)
+		return ret;
+
 	/* Iris1 exposes an additional DSP view of the same HFI queues. */
 	if (IS_IRIS1(hdev->core)) {
 		dev_info(dev, "Iris1 run: program DSP queue view\n");
@@ -627,6 +670,10 @@ static int venus_run(struct venus_hfi_device *hdev)
 		dev_info(dev, "Iris1 HFI queues: dma=%pad size=%#x\n",
 			 &hdev->ifaceq_table.da, (u32)SHARED_QSIZE);
 	}
+
+	ret = venus_iris1_run_stop(hdev, 4, "DSP queue view");
+	if (ret)
+		return ret;
 
 	ret = venus_boot_core(hdev);
 	if (ret) {
@@ -760,11 +807,19 @@ static int venus_power_on(struct venus_hfi_device *hdev)
 	if (IS_IRIS1(hdev->core))
 		dev_info(dev, "Iris1 HFI power-on: remote-state resume done\n");
 
+	ret = venus_iris1_run_stop(hdev, 1, "remote-state resume");
+	if (ret)
+		goto err_keep_power;
+
 	if (IS_IRIS1(hdev->core))
 		dev_info(dev, "Iris1 HFI power-on: venus_run start\n");
 	ret = venus_run(hdev);
-	if (ret)
+	if (ret) {
+		if (IS_IRIS1(hdev->core) && iris1_run_stage &&
+		    ret == -ECANCELED)
+			goto err_keep_power;
 		goto err_suspend;
+	}
 	if (IS_IRIS1(hdev->core))
 		dev_info(dev, "Iris1 HFI power-on: venus_run done\n");
 
@@ -774,6 +829,7 @@ static int venus_power_on(struct venus_hfi_device *hdev)
 
 err_suspend:
 	venus_set_hw_state_suspend(hdev->core);
+err_keep_power:
 err:
 	hdev->power_enabled = false;
 	return ret;
@@ -1858,6 +1914,16 @@ int venus_hfi_create(struct venus_core *core)
 {
 	struct venus_hfi_device *hdev;
 	int ret;
+
+	if (IS_IRIS1(core) && iris1_run_stage > 6) {
+		dev_err(core->dev, "invalid Iris1 run stage %u\n",
+			iris1_run_stage);
+		return -EINVAL;
+	}
+
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 run diagnostic configuration: stage=%u\n",
+			 iris1_run_stage);
 
 	hdev = kzalloc_obj(*hdev);
 	if (!hdev)

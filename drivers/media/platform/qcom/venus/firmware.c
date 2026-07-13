@@ -50,11 +50,6 @@ module_param(iris1_fw_hold_ms, uint, 0400);
 MODULE_PARM_DESC(iris1_fw_hold_ms,
 		 "Iris1 stage 5 runtime before immediate firmware shutdown");
 
-static bool iris1_pas_pre_shutdown = true;
-module_param(iris1_pas_pre_shutdown, bool, 0400);
-MODULE_PARM_DESC(iris1_pas_pre_shutdown,
-		 "Shut down Iris1 PAS before loading a new firmware image");
-
 static unsigned int iris1_fw_checkpoint_ms = 1500;
 module_param(iris1_fw_checkpoint_ms, uint, 0400);
 MODULE_PARM_DESC(iris1_fw_checkpoint_ms,
@@ -289,7 +284,6 @@ int venus_boot(struct venus_core *core)
 	size_t mem_size;
 	u64 auth_start = 0, auth_ns = 0;
 	u64 protect_start = 0, protect_ns = 0;
-	u64 shutdown_start, shutdown_ns;
 	int shutdown_ret, ret;
 
 	if (IS_IRIS1(core)) {
@@ -308,18 +302,6 @@ int venus_boot(struct venus_core *core)
 	if (!IS_ENABLED(CONFIG_QCOM_MDT_LOADER) ||
 	    (core->use_tz && !qcom_scm_is_available()))
 		return -EPROBE_DEFER;
-
-	if (IS_IRIS1(core) && core->use_tz && iris1_pas_pre_shutdown) {
-		venus_fw_checkpoint(core, "PAS pre-shutdown start");
-		shutdown_start = ktime_get_ns();
-		shutdown_ret = qcom_scm_pas_shutdown(VENUS_PAS_ID);
-		shutdown_ns = ktime_get_ns() - shutdown_start;
-		dev_info(dev, "Iris1 PAS pre-shutdown: ret=%d time=%llu us\n",
-			 shutdown_ret, div_u64(shutdown_ns, NSEC_PER_USEC));
-		venus_fw_checkpoint(core, "PAS pre-shutdown result committed");
-		if (shutdown_ret && shutdown_ret != -EINVAL)
-			return shutdown_ret;
-	}
 
 	ret = of_property_read_string_index(dev->of_node, "firmware-name", 0,
 					    &fwpath);
