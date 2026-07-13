@@ -461,11 +461,16 @@ static int q6slim_set_channel_map(struct snd_soc_dai *dai,
 
 	if (dai->id & 0x1) {
 		/* TX */
-		if (!tx_slot) {
-			pr_err("%s: tx slot not found\n", __func__);
+		if (!tx_slot || !tx_num || tx_num > AFE_MAX_CHAN_COUNT) {
+			dev_err_ratelimited(dai->dev,
+					    "invalid SLIM TX map: dai=%d channels=%u slots=%s\n",
+					    dai->id, tx_num,
+					    tx_slot ? "present" : "missing");
 			return -EINVAL;
 		}
 
+		memset(pcfg->slim.ch_mapping, 0,
+		       sizeof(pcfg->slim.ch_mapping));
 		for (i = 0; i < tx_num; i++)
 			pcfg->slim.ch_mapping[i] = tx_slot[i];
 
@@ -473,11 +478,16 @@ static int q6slim_set_channel_map(struct snd_soc_dai *dai,
 
 
 	} else {
-		if (!rx_slot) {
-			pr_err("%s: rx slot not found\n", __func__);
+		if (!rx_slot || !rx_num || rx_num > AFE_MAX_CHAN_COUNT) {
+			dev_err_ratelimited(dai->dev,
+					    "invalid SLIM RX map: dai=%d channels=%u slots=%s\n",
+					    dai->id, rx_num,
+					    rx_slot ? "present" : "missing");
 			return -EINVAL;
 		}
 
+		memset(pcfg->slim.ch_mapping, 0,
+		       sizeof(pcfg->slim.ch_mapping));
 		for (i = 0; i < rx_num; i++)
 			pcfg->slim.ch_mapping[i] =   rx_slot[i];
 
