@@ -147,15 +147,16 @@ MODULE_PARM_DESC(iris1_run_stage,
 		 "Iris1 stop: 0=full, 1=remote, 2=preset, 3=CPUQ, 4=DSPQ, 5=IRQ, 6=ready");
 
 /*
- * Isolate the two writes used to acknowledge an Iris1 interrupt.  Stages 1
- * and 2 disable the Linux IRQ before returning so an unacknowledged level
- * interrupt cannot turn into an interrupt storm.  Stage 0 is the normal
- * production sequence; stage 3 performs the same writes with checkpoints.
+ * Isolate the two writes used to acknowledge an Iris1 interrupt.  Diagnostic
+ * stages disable the Linux IRQ before returning so a partial ACK cannot turn
+ * into an interrupt storm.  Stage 0 is the normal production sequence;
+ * stage 3 performs both writes but does not wake the threaded handler, keeping
+ * ACK validation separate from queue processing.
  */
 static unsigned int iris1_irq_ack_stage;
 module_param(iris1_irq_ack_stage, uint, 0400);
 MODULE_PARM_DESC(iris1_irq_ack_stage,
-		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=full-trace");
+		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=full-stop");
 
 static int venus_iris1_run_stop(struct venus_hfi_device *hdev,
 				unsigned int stage, const char *name)
@@ -1364,6 +1365,13 @@ static irqreturn_t venus_isr(struct venus_core *core)
 		writel(status, wrapper_base + WRAPPER_INTR_CLEAR);
 	if (IS_IRIS1(core))
 		dev_info(core->dev, "Iris1 IRQ ACK: wrapper clear committed\n");
+
+	if (IS_IRIS1(core) && iris1_irq_ack_stage == 3) {
+		dev_info(core->dev,
+			 "Iris1 IRQ diagnostic stop: full ACK committed\n");
+		disable_irq_nosync(core->irq);
+		return IRQ_HANDLED;
+	}
 
 	return IRQ_WAKE_THREAD;
 }
