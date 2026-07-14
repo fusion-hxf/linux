@@ -146,6 +146,17 @@ module_param(iris1_run_stage, uint, 0400);
 MODULE_PARM_DESC(iris1_run_stage,
 		 "Iris1 stop: 0=full, 1=remote, 2=preset, 3=CPUQ, 4=DSPQ, 5=IRQ, 6=ready");
 
+/*
+ * Isolate the two writes used to acknowledge an Iris1 interrupt.  Stages 1
+ * and 2 disable the Linux IRQ before returning so an unacknowledged level
+ * interrupt cannot turn into an interrupt storm.  Stage 0 is the normal
+ * production sequence; stage 3 performs the same writes with checkpoints.
+ */
+static unsigned int iris1_irq_ack_stage;
+module_param(iris1_irq_ack_stage, uint, 0400);
+MODULE_PARM_DESC(iris1_irq_ack_stage,
+		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=full-trace");
+
 static int venus_iris1_run_stop(struct venus_hfi_device *hdev,
 				unsigned int stage, const char *name)
 {
@@ -1326,9 +1337,33 @@ static irqreturn_t venus_isr(struct venus_core *core)
 		    status & CPU_CS_SCIACMDARG0_INIT_IDLE_MSG_MASK)
 			hdev->irq_status = status;
 	}
+
+	if (IS_IRIS1(core) && iris1_irq_ack_stage == 1) {
+		dev_info(core->dev,
+			 "Iris1 IRQ diagnostic stop: status captured, ACK skipped\n");
+		disable_irq_nosync(core->irq);
+		return IRQ_HANDLED;
+	}
+
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 IRQ ACK: CPU clear start\n");
 	writel(1, cpu_cs_base + CPU_CS_A2HSOFTINTCLR);
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 IRQ ACK: CPU clear committed\n");
+
+	if (IS_IRIS1(core) && iris1_irq_ack_stage == 2) {
+		dev_info(core->dev,
+			 "Iris1 IRQ diagnostic stop: wrapper clear skipped\n");
+		disable_irq_nosync(core->irq);
+		return IRQ_HANDLED;
+	}
+
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 IRQ ACK: wrapper clear start\n");
 	if (!(IS_IRIS2(core) || IS_IRIS2_1(core) || IS_AR50_LITE(core)))
 		writel(status, wrapper_base + WRAPPER_INTR_CLEAR);
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 IRQ ACK: wrapper clear committed\n");
 
 	return IRQ_WAKE_THREAD;
 }
@@ -1921,9 +1956,16 @@ int venus_hfi_create(struct venus_core *core)
 		return -EINVAL;
 	}
 
+	if (IS_IRIS1(core) && iris1_irq_ack_stage > 3) {
+		dev_err(core->dev, "invalid Iris1 IRQ ACK stage %u\n",
+			iris1_irq_ack_stage);
+		return -EINVAL;
+	}
+
 	if (IS_IRIS1(core))
-		dev_info(core->dev, "Iris1 run diagnostic configuration: stage=%u\n",
-			 iris1_run_stage);
+		dev_info(core->dev,
+			 "Iris1 diagnostics: run-stage=%u irq-ack-stage=%u\n",
+			 iris1_run_stage, iris1_irq_ack_stage);
 
 	hdev = kzalloc_obj(*hdev);
 	if (!hdev)
