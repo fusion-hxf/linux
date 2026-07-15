@@ -151,12 +151,13 @@ MODULE_PARM_DESC(iris1_run_stage,
  * stages disable the Linux IRQ before returning so a partial ACK cannot turn
  * into an interrupt storm.  Stage 0 is the normal production sequence;
  * stage 3 performs a masked wrapper clear but does not wake the threaded
- * handler, keeping ACK validation separate from queue processing.
+ * handler.  Stage 4 masks the wrapper after the CPU clear and never accesses
+ * the wrapper clear register.
  */
 static unsigned int iris1_irq_ack_stage;
 module_param(iris1_irq_ack_stage, uint, 0400);
 MODULE_PARM_DESC(iris1_irq_ack_stage,
-		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=masked-stop");
+		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=masked-stop, 4=CPU-mask-stop");
 
 static unsigned int iris1_irq_checkpoint_ms;
 module_param(iris1_irq_checkpoint_ms, uint, 0400);
@@ -538,7 +539,7 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 {
 	struct device *dev = hdev->core->dev;
 	static const unsigned int max_tries = 1000;
-	u32 ctrl_status = 0, mask_val = 0;
+	u32 ctrl_status = 0, intr_status, mask_val = 0;
 	unsigned int count = 0;
 	void __iomem *cpu_cs_base = hdev->core->cpu_cs_base;
 	void __iomem *wrapper_base = hdev->core->wrapper_base;
@@ -559,6 +560,29 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 		mask_val = WRAPPER_INTR_MASK_A2HVCODEC_MASK;
 	}
 
+	if (IS_IRIS1(hdev->core) && iris1_irq_ack_stage >= 3) {
+		unsigned int delay_ms = min(iris1_irq_checkpoint_ms, 1000U);
+
+		intr_status = readl(wrapper_base + WRAPPER_INTR_STATUS);
+		dev_info(dev,
+			 "Iris1 IRQ diagnostic: stage=%u armed pre-unmask status=%#x target-mask=%#x; trigger in %u ms\n",
+			 iris1_irq_ack_stage, intr_status, mask_val, delay_ms);
+		msleep(delay_ms);
+		intr_status = readl(wrapper_base + WRAPPER_INTR_STATUS);
+		dev_info(dev,
+			 "Iris1 IRQ diagnostic: pre-unmask recheck status=%#x\n",
+			 intr_status);
+
+		if (intr_status & (WRAPPER_INTR_STATUS_A2H_MASK |
+				   WRAPPER_INTR_STATUS_A2HWD_MASK |
+				   CPU_CS_SCIACMDARG0_INIT_IDLE_MSG_MASK)) {
+			dev_err(dev,
+				"Iris1 IRQ diagnostic refused: pending pre-unmask status=%#x\n",
+				intr_status);
+			return -EBUSY;
+		}
+	}
+
 	writel(mask_val, wrapper_base + WRAPPER_INTR_MASK);
 	if (IS_IRIS1(hdev->core))
 		dev_info(dev, "Iris1 interrupts unmasked: mask=%#x\n", mask_val);
@@ -566,15 +590,6 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	ret = venus_iris1_run_stop(hdev, 5, "interrupt setup");
 	if (ret)
 		return ret;
-
-	if (IS_IRIS1(hdev->core) && iris1_irq_ack_stage == 3) {
-		unsigned int delay_ms = min(iris1_irq_checkpoint_ms, 1000U);
-
-		dev_info(dev,
-			 "Iris1 IRQ diagnostic: masked wrapper clear armed; trigger in %u ms\n",
-			 delay_ms);
-		msleep(delay_ms);
-	}
 
 	if (IS_V1(hdev->core))
 		writel(1, cpu_cs_base + CPU_CS_SCIACMDARG3);
@@ -1380,6 +1395,21 @@ static irqreturn_t venus_isr(struct venus_core *core)
 		return IRQ_HANDLED;
 	}
 
+	if (IS_IRIS1(core) && iris1_irq_ack_stage == 4) {
+		u32 mask = readl(wrapper_base + WRAPPER_INTR_MASK);
+
+		mask |= WRAPPER_INTR_MASK_A2HWD_BASK |
+			WRAPPER_INTR_MASK_A2HCPU_MASK;
+		dev_info(core->dev,
+			 "Iris1 IRQ ACK: wrapper mask start status=%#x mask=%#x\n",
+			 status, mask);
+		writel(mask, wrapper_base + WRAPPER_INTR_MASK);
+		dev_info(core->dev,
+			 "Iris1 IRQ diagnostic stop: CPU clear and wrapper mask committed\n");
+		disable_irq_nosync(core->irq);
+		return IRQ_HANDLED;
+	}
+
 	clear = status;
 	if (IS_IRIS1(core) && iris1_irq_ack_stage == 3) {
 		clear &= WRAPPER_INTR_CLEAR_A2H_MASK |
@@ -1997,7 +2027,7 @@ int venus_hfi_create(struct venus_core *core)
 		return -EINVAL;
 	}
 
-	if (IS_IRIS1(core) && iris1_irq_ack_stage > 3) {
+	if (IS_IRIS1(core) && iris1_irq_ack_stage > 4) {
 		dev_err(core->dev, "invalid Iris1 IRQ ACK stage %u\n",
 			iris1_irq_ack_stage);
 		return -EINVAL;

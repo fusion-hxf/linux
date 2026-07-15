@@ -3822,9 +3822,11 @@
 
 			clocks = <&gcc GCC_VIDEO_AXI0_CLK>,
 				 <&gcc GCC_VIDEO_AXIC_CLK>,
+				 <&gcc GCC_VIDEO_AXI1_CLK>,
 				 <&videocc VIDEO_CC_MVSC_CORE_CLK>,
 				 <&videocc VIDEO_CC_MVS0_CORE_CLK>;
-			clock-names = "iface", "bus", "core", "vcodec0_core";
+			clock-names = "iface", "bus", "bus1", "core",
+				      "vcodec0_core";
 
 			power-domains = <&videocc VENUS_GDSC>,
 					<&videocc VCODEC0_GDSC>,
