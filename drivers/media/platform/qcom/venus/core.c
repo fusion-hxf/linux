@@ -43,6 +43,39 @@ module_param(iris1_probe_stage, uint, 0400);
 MODULE_PARM_DESC(iris1_probe_stage,
 		 "Iris1 probe stage: 0=full, 1=boot-stop, 2=cfg-stop, 3=resume-stop, 4=init-stop");
 
+/*
+ * Qualcomm's downstream SM8150 bring-up votes the video DDR path in turbo
+ * mode and keeps a separate minimum vote for the firmware processor.  Keep
+ * both values read-only module parameters so a single diagnostic kernel can
+ * compare conservative and downstream-equivalent votes after a cold boot.
+ * Values are in the kB/s units accepted by icc_set_bw().
+ */
+static unsigned int iris1_boot_video_bw_kbps = 6533000;
+module_param(iris1_boot_video_bw_kbps, uint, 0400);
+MODULE_PARM_DESC(iris1_boot_video_bw_kbps,
+		 "Iris1 boot video-memory average bandwidth in ICC kB/s");
+
+static unsigned int iris1_boot_proc_bw_kbps = 1000;
+module_param(iris1_boot_proc_bw_kbps, uint, 0400);
+MODULE_PARM_DESC(iris1_boot_proc_bw_kbps,
+		 "Iris1 firmware-processor memory bandwidth in ICC kB/s");
+
+static u32 venus_boot_video_bw(struct venus_core *core)
+{
+	if (IS_IRIS1(core))
+		return iris1_boot_video_bw_kbps;
+
+	return kbps_to_icc(20000);
+}
+
+static u32 venus_boot_proc_bw(struct venus_core *core)
+{
+	if (IS_IRIS1(core))
+		return iris1_boot_proc_bw_kbps;
+
+	return 0;
+}
+
 static void venus_iris1_checkpoint(struct venus_core *core, const char *stage)
 {
 	if (!IS_IRIS1(core))
@@ -461,6 +494,14 @@ static int venus_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(core->cpucfg_path),
 				     "failed to get cpu-cfg interconnect\n");
 
+	if (IS_IRIS1(core)) {
+		core->video_proc_path =
+			devm_of_icc_get(dev, "video-processor");
+		if (IS_ERR(core->video_proc_path))
+			return dev_err_probe(dev, PTR_ERR(core->video_proc_path),
+					     "failed to get video-processor interconnect\n");
+	}
+
 	core->irq = platform_get_irq(pdev, 0);
 	if (core->irq < 0)
 		return dev_err_probe(dev, core->irq, "failed to get IRQ\n");
@@ -684,6 +725,17 @@ err_runtime_disable:
 		dev_warn(dev, "probe cleanup: cpu-cfg ICC failed (%d)\n",
 			 icc_ret);
 
+	if (core->video_proc_path) {
+		icc_ret = icc_set_bw(core->video_proc_path, 0, 0);
+		if (icc_ret)
+			dev_warn(dev,
+				 "probe cleanup: video-processor ICC failed (%d)\n",
+				 icc_ret);
+		else if (IS_IRIS1(core))
+			dev_info(dev,
+				 "probe cleanup: video-processor ICC vote removed\n");
+	}
+
 	icc_ret = icc_set_bw(core->video_path, 0, 0);
 	if (icc_ret)
 		dev_warn(dev, "probe cleanup: video-mem ICC failed (%d)\n",
@@ -764,6 +816,7 @@ static __maybe_unused int venus_runtime_suspend(struct device *dev)
 {
 	struct venus_core *core = dev_get_drvdata(dev);
 	const struct venus_pm_ops *pm_ops = core->pm_ops;
+	u32 proc_bw = venus_boot_proc_bw(core);
 	int ret;
 
 	ret = hfi_core_suspend(core);
@@ -780,6 +833,12 @@ static __maybe_unused int venus_runtime_suspend(struct device *dev)
 	if (ret)
 		goto err_cpucfg_path;
 
+	if (core->video_proc_path) {
+		ret = icc_set_bw(core->video_proc_path, 0, 0);
+		if (ret)
+			goto err_video_proc_path;
+	}
+
 	ret = icc_set_bw(core->video_path, 0, 0);
 	if (ret)
 		goto err_video_path;
@@ -787,6 +846,9 @@ static __maybe_unused int venus_runtime_suspend(struct device *dev)
 	return ret;
 
 err_video_path:
+	if (core->video_proc_path)
+		icc_set_bw(core->video_proc_path, proc_bw, 0);
+err_video_proc_path:
 	icc_set_bw(core->cpucfg_path, kbps_to_icc(1000), 0);
 err_cpucfg_path:
 	if (pm_ops->core_power)
@@ -819,25 +881,40 @@ static __maybe_unused int venus_runtime_resume(struct device *dev)
 {
 	struct venus_core *core = dev_get_drvdata(dev);
 	const struct venus_pm_ops *pm_ops = core->pm_ops;
+	u32 proc_bw = venus_boot_proc_bw(core);
+	u32 video_bw = venus_boot_video_bw(core);
 	int ret;
 
+	if (IS_IRIS1(core))
+		dev_info(dev,
+			 "Iris1 boot ICC configuration: video-mem=%u kB/s video-processor=%u kB/s cpu-cfg=%u kB/s\n",
+			 video_bw, proc_bw, kbps_to_icc(1000));
+
 	venus_iris1_checkpoint(core, "video-mem ICC vote start");
-	ret = icc_set_bw(core->video_path, kbps_to_icc(20000), 0);
+	ret = icc_set_bw(core->video_path, video_bw, 0);
 	if (ret)
 		return ret;
 	venus_iris1_checkpoint(core, "video-mem ICC vote done");
 
+	if (core->video_proc_path) {
+		venus_iris1_checkpoint(core, "video-processor ICC vote start");
+		ret = icc_set_bw(core->video_proc_path, proc_bw, 0);
+		if (ret)
+			goto err_video_proc_path;
+		venus_iris1_checkpoint(core, "video-processor ICC vote done");
+	}
+
 	venus_iris1_checkpoint(core, "cpu-cfg ICC vote start");
 	ret = icc_set_bw(core->cpucfg_path, kbps_to_icc(1000), 0);
 	if (ret)
-		return ret;
+		goto err_cpucfg_path;
 	venus_iris1_checkpoint(core, "cpu-cfg ICC vote done");
 
 	if (pm_ops->core_power) {
 		venus_iris1_checkpoint(core, "core power-on callback start");
 		ret = pm_ops->core_power(core, POWER_ON);
 		if (ret)
-			return ret;
+			goto err_core_power;
 		venus_iris1_checkpoint(core, "core power-on callback done");
 	}
 
@@ -845,7 +922,21 @@ static __maybe_unused int venus_runtime_resume(struct device *dev)
 	ret = hfi_core_resume(core, false);
 	if (!ret)
 		venus_iris1_checkpoint(core, "HFI runtime resume done");
+	else
+		goto err_hfi_resume;
 
+	return 0;
+
+err_hfi_resume:
+	if (pm_ops->core_power)
+		pm_ops->core_power(core, POWER_OFF);
+err_core_power:
+	icc_set_bw(core->cpucfg_path, 0, 0);
+err_cpucfg_path:
+	if (core->video_proc_path)
+		icc_set_bw(core->video_proc_path, 0, 0);
+err_video_proc_path:
+	icc_set_bw(core->video_path, 0, 0);
 	return ret;
 }
 

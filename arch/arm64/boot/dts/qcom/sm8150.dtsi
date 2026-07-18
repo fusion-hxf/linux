@@ -3837,8 +3837,11 @@
 			interconnects = <&gem_noc MASTER_AMPSS_M0 0
 					 &config_noc SLAVE_VENUS_CFG 0>,
 					<&mmss_noc MASTER_VIDEO_P0 0
+					 &mc_virt SLAVE_EBI_CH0 0>,
+					<&mmss_noc MASTER_VIDEO_PROC 0
 					 &mc_virt SLAVE_EBI_CH0 0>;
-			interconnect-names = "cpu-cfg", "video-mem";
+			interconnect-names = "cpu-cfg", "video-mem",
+					     "video-processor";
 
 			iommus = <&apps_smmu 0x1300 0x60>;
 			memory-region = <&venus_mem>;

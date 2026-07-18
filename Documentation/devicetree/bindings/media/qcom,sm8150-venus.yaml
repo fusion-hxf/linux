@@ -21,12 +21,13 @@ properties:
     const: qcom,sm8150-venus
 
   clocks:
-    maxItems: 4
+    maxItems: 5
 
   clock-names:
     items:
       - const: iface
       - const: bus
+      - const: bus1
       - const: core
       - const: vcodec0_core
 
@@ -41,13 +42,14 @@ properties:
       - const: mx
 
   interconnects:
-    minItems: 2
-    maxItems: 2
+    minItems: 3
+    maxItems: 3
 
   interconnect-names:
     items:
       - const: cpu-cfg
       - const: video-mem
+      - const: video-processor
 
   iommus:
     maxItems: 1

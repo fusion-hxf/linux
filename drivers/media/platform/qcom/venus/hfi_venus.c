@@ -161,17 +161,20 @@ MODULE_PARM_DESC(iris1_run_stage,
  * masks the source, then performs the complete Qualcomm Iris1 ACK sequence and
  * verifies the register readback before teardown.  Stage 6 keeps both the
  * wrapper source and Linux IRQ disabled, then boots and acknowledges entirely
- * from probe context so no interrupt can reach the GIC.
+ * from probe context so no interrupt can reach the GIC.  Stage 7 keeps the
+ * same masking but deliberately performs no Venus MMIO after CTRL_INIT; its
+ * delayed heartbeat distinguishes a blocked status read from firmware/NoC
+ * failure caused by the trigger itself.
  */
 static unsigned int iris1_irq_ack_stage;
 module_param(iris1_irq_ack_stage, uint, 0400);
 MODULE_PARM_DESC(iris1_irq_ack_stage,
-		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=masked-stop, 4=CPU-mask-stop, 5=mask-full-clear-verify, 6=masked-poll-verify");
+		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=masked-stop, 4=CPU-mask-stop, 5=mask-full-clear-verify, 6=masked-poll-verify, 7=masked-trigger-no-read");
 
 static unsigned int iris1_irq_checkpoint_ms;
 module_param(iris1_irq_checkpoint_ms, uint, 0400);
 MODULE_PARM_DESC(iris1_irq_checkpoint_ms,
-		 "Iris1 pre-trigger delay and stage 5/6 checkpoint wait in milliseconds");
+		 "Iris1 pre-trigger delay and stage 5/6/7 checkpoint wait in milliseconds");
 
 static int venus_iris1_run_stop(struct venus_hfi_device *hdev,
 				unsigned int stage, const char *name)
@@ -635,7 +638,8 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	struct device *dev = hdev->core->dev;
 	static const unsigned int max_tries = 1000;
 	u32 ctrl_status = 0, intr_status, mask_readback, mask_val = 0;
-	bool iris1_poll_only;
+	const char *diagnostic_path = "hardirq";
+	bool iris1_masked_diag, iris1_no_read, iris1_poll_only;
 	unsigned int count = 0;
 	unsigned int delay_ms;
 	void __iomem *cpu_cs_base = hdev->core->cpu_cs_base;
@@ -644,6 +648,13 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 
 	iris1_poll_only = IS_IRIS1(hdev->core) &&
 			  iris1_irq_ack_stage == 6;
+	iris1_no_read = IS_IRIS1(hdev->core) &&
+			iris1_irq_ack_stage == 7;
+	iris1_masked_diag = iris1_poll_only || iris1_no_read;
+	if (iris1_poll_only)
+		diagnostic_path = "masked-poll";
+	else if (iris1_no_read)
+		diagnostic_path = "masked-trigger-no-read";
 	delay_ms = min(iris1_irq_checkpoint_ms, 1000U);
 
 	if (IS_IRIS1(hdev->core))
@@ -655,7 +666,7 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 			      WRAPPER_INTR_MASK_A2HCPU_MASK);
 	} else if (IS_IRIS1(hdev->core)) {
 		mask_val = readl(wrapper_base + WRAPPER_INTR_MASK);
-		if (iris1_poll_only)
+		if (iris1_masked_diag)
 			mask_val |= WRAPPER_INTR_MASK_A2HWD_BASK |
 				    WRAPPER_INTR_MASK_A2HCPU_MASK;
 		else
@@ -670,7 +681,7 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 		dev_info(dev,
 			 "Iris1 IRQ diagnostic: stage=%u armed pre-trigger status=%#x target-mask=%#x path=%s; setup in %u ms\n",
 			 iris1_irq_ack_stage, intr_status, mask_val,
-			 iris1_poll_only ? "masked-poll" : "hardirq", delay_ms);
+			 diagnostic_path, delay_ms);
 		msleep(delay_ms);
 		intr_status = readl(wrapper_base + WRAPPER_INTR_STATUS);
 		dev_info(dev,
@@ -687,27 +698,30 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 		}
 	}
 
-	if (iris1_poll_only) {
+	if (iris1_masked_diag) {
 		dev_info(dev,
-			 "Iris1 IRQ stage 6: Linux IRQ disable start before trigger\n");
+			 "Iris1 IRQ stage %u: Linux IRQ disable start before trigger\n",
+			 iris1_irq_ack_stage);
 		disable_irq(hdev->core->irq);
 		hdev->irq_disabled = true;
 		dev_info(dev,
-			 "Iris1 IRQ stage 6: Linux IRQ disabled before trigger\n");
+			 "Iris1 IRQ stage %u: Linux IRQ disabled before trigger\n",
+			 iris1_irq_ack_stage);
 	}
 
 	writel(mask_val, wrapper_base + WRAPPER_INTR_MASK);
 	mask_readback = readl(wrapper_base + WRAPPER_INTR_MASK);
-	if (iris1_poll_only) {
+	if (iris1_masked_diag) {
 		u32 ack_mask = WRAPPER_INTR_MASK_A2HWD_BASK |
 			       WRAPPER_INTR_MASK_A2HCPU_MASK;
 
 		dev_info(dev,
-			 "Iris1 IRQ stage 6: wrapper source masked before trigger mask=%#x\n",
-			 mask_readback);
+			 "Iris1 IRQ stage %u: wrapper source masked before trigger mask=%#x\n",
+			 iris1_irq_ack_stage, mask_readback);
 		if ((mask_readback & ack_mask) != ack_mask)
 			return dev_err_probe(dev, -EIO,
-					     "Iris1 IRQ stage 6: wrapper mask readback failed\n");
+					     "Iris1 IRQ stage %u: wrapper mask readback failed\n",
+					     iris1_irq_ack_stage);
 		msleep(delay_ms);
 	} else if (IS_IRIS1(hdev->core)) {
 		dev_info(dev, "Iris1 interrupts unmasked: mask=%#x\n",
@@ -721,14 +735,31 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	if (IS_V1(hdev->core))
 		writel(1, cpu_cs_base + CPU_CS_SCIACMDARG3);
 
-	if (IS_IRIS1(hdev->core))
+	if (iris1_no_read)
+		dev_info(dev,
+			 "Iris1 IRQ stage 7: write VIDC_CTRL_INIT=%#x; no Venus MMIO follows\n",
+			 BIT(VIDC_CTRL_INIT_CTRL_SHIFT));
+	else if (IS_IRIS1(hdev->core))
 		dev_info(dev,
 			 "Iris1 boot-core: write VIDC_CTRL_INIT=%#x, then poll SCIACMDARG0\n",
 			 BIT(VIDC_CTRL_INIT_CTRL_SHIFT));
 	writel(BIT(VIDC_CTRL_INIT_CTRL_SHIFT), cpu_cs_base + VIDC_CTRL_INIT);
-	if (IS_IRIS1(hdev->core))
+	if (iris1_no_read) {
+		unsigned int wait_ms;
+
+		wait_ms = clamp(iris1_irq_checkpoint_ms, 250U, 2000U);
+		dev_info(dev,
+			 "Iris1 IRQ stage 7: CTRL_INIT write committed; entering %u ms no-MMIO wait\n",
+			 wait_ms);
+		msleep(wait_ms);
+		dev_info(dev,
+			 "Iris1 IRQ stage 7 heartbeat: survived trigger without Venus MMIO for %u ms\n",
+			 wait_ms);
+		return -ECANCELED;
+	} else if (IS_IRIS1(hdev->core)) {
 		dev_info(dev,
 			 "Iris1 boot-core: VIDC_CTRL_INIT write committed; polling status\n");
+	}
 	while (!ctrl_status && count < max_tries) {
 		ctrl_status = readl(cpu_cs_base + CPU_CS_SCIACMDARG0);
 		if ((ctrl_status & CPU_CS_SCIACMDARG0_ERROR_STATUS_MASK) == 4) {
@@ -2276,7 +2307,7 @@ int venus_hfi_create(struct venus_core *core)
 		return -EINVAL;
 	}
 
-	if (IS_IRIS1(core) && iris1_irq_ack_stage > 6) {
+	if (IS_IRIS1(core) && iris1_irq_ack_stage > 7) {
 		dev_err(core->dev, "invalid Iris1 IRQ ACK stage %u\n",
 			iris1_irq_ack_stage);
 		return -EINVAL;

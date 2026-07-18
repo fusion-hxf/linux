@@ -143,6 +143,7 @@ struct venus_format {
  * @vcodec0_clks: an array of vcodec0 struct clk pointers
  * @vcodec1_clks: an array of vcodec1 struct clk pointers
  * @video_path: an interconnect handle to video to/from memory path
+ * @video_proc_path: an interconnect handle for the Iris firmware processor
  * @cpucfg_path: an interconnect handle to cpu configuration path
  * @pmdomains:	a pointer to a list of pmdomains
  * @opp_pmdomain: an OPP power-domain
@@ -197,6 +198,7 @@ struct venus_core {
 	struct clk *vcodec0_clks[VIDC_VCODEC_CLKS_NUM_MAX];
 	struct clk *vcodec1_clks[VIDC_VCODEC_CLKS_NUM_MAX];
 	struct icc_path *video_path;
+	struct icc_path *video_proc_path;
 	struct icc_path *cpucfg_path;
 	struct dev_pm_domain_list *pmdomains;
 	struct dev_pm_domain_list *opp_pmdomain;

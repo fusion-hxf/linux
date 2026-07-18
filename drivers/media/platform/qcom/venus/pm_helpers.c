@@ -8,6 +8,7 @@
 #include <linux/interconnect.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_runtime.h>
@@ -22,6 +23,11 @@
 #include "hfi_platform.h"
 
 static bool legacy_binding;
+
+static unsigned long iris1_boot_rate_hz = 240000000;
+module_param(iris1_boot_rate_hz, ulong, 0400);
+MODULE_PARM_DESC(iris1_boot_rate_hz,
+		 "Iris1 boot clock rate requested before firmware start");
 
 static void iris1_resource_checkpoint(struct venus_core *core,
 				      const char *stage)
@@ -54,18 +60,43 @@ static int core_clks_enable(struct venus_core *core)
 	unsigned int freq_tbl_size = core->res->freq_tbl_size;
 	const struct venus_resources *res = core->res;
 	struct device *dev = core->dev;
-	unsigned long freq = 0;
+	unsigned long requested_freq = 0;
+	unsigned long freq;
 	struct dev_pm_opp *opp;
+	bool opp_rate_set = false;
 	unsigned int i;
 	int ret;
 
+	if (IS_IRIS1(core))
+		requested_freq = iris1_boot_rate_hz;
+	freq = requested_freq;
 	opp = dev_pm_opp_find_freq_ceil(dev, &freq);
 	if (IS_ERR(opp)) {
+		if (IS_IRIS1(core) && requested_freq)
+			return dev_err_probe(dev, PTR_ERR(opp),
+					     "Iris1 boot rate %lu has no valid OPP\n",
+					     requested_freq);
 		if (!freq_tbl)
 			return -ENODEV;
 		freq = freq_tbl[freq_tbl_size - 1].freq;
 	} else {
 		dev_pm_opp_put(opp);
+	}
+
+	if (IS_IRIS1(core))
+		dev_info(dev,
+			 "Iris1 boot clock selection: requested=%lu selected-opp=%lu\n",
+			 requested_freq, freq);
+
+	if (IS_IRIS1(core) && core->opp_pmdomain) {
+		ret = dev_pm_opp_set_rate(dev, freq);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to apply Iris1 boot OPP %lu\n",
+					     freq);
+		opp_rate_set = true;
+		dev_info(dev,
+			 "Iris1 boot OPP and required power-domain state applied\n");
 	}
 
 	for (i = 0; i < res->clks_num; i++) {
@@ -95,6 +126,8 @@ static int core_clks_enable(struct venus_core *core)
 err:
 	while (i--)
 		clk_disable_unprepare(core->clks[i]);
+	if (opp_rate_set)
+		dev_pm_opp_set_rate(dev, 0);
 
 	return ret;
 }
@@ -1173,6 +1206,8 @@ static int core_power_v4(struct venus_core *core, int on)
 
 err_core_clks:
 	core_clks_disable(core);
+	if (core->opp_pmdomain)
+		dev_pm_opp_set_rate(dev, 0);
 err_vcodec_domain:
 	if (IS_IRIS1(core) && vcodec0)
 		pm_runtime_put_sync(vcodec0);
