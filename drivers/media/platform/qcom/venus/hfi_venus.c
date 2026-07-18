@@ -115,6 +115,10 @@ enum venus_state {
 struct venus_hfi_device {
 	struct venus_core *core;
 	u32 irq_status;
+	u32 iris1_irq_status_after;
+	u32 iris1_irq_mask_after;
+	int iris1_irq_ack_ret;
+	bool iris1_irq_ack_complete;
 	u32 last_packet_type;
 	bool power_enabled;
 	bool suspended;
@@ -123,6 +127,7 @@ struct venus_hfi_device {
 	struct mutex lock;
 	struct completion pwr_collapse_prep;
 	struct completion release_resource;
+	struct completion iris1_irq_ack_done;
 	struct mem_desc ifaceq_table;
 	struct mem_desc sfr;
 	struct iface_queue queues[IFACEQ_NUM];
@@ -148,16 +153,16 @@ MODULE_PARM_DESC(iris1_run_stage,
 
 /*
  * Isolate the two writes used to acknowledge an Iris1 interrupt.  Diagnostic
- * stages disable the Linux IRQ before returning so a partial ACK cannot turn
- * into an interrupt storm.  Stage 0 is the normal production sequence;
- * stage 3 performs a masked wrapper clear but does not wake the threaded
- * handler.  Stage 4 masks the wrapper after the CPU clear and never accesses
- * the wrapper clear register.
+ * stages stop before queue processing.  Stage 0 is the normal production
+ * sequence; stage 3 performs a masked wrapper clear, stage 4 masks the wrapper
+ * after the CPU clear without touching WRAPPER_INTR_CLEAR, and stage 5 first
+ * masks the source, then performs the complete Qualcomm Iris1 ACK sequence and
+ * verifies the register readback before teardown.
  */
 static unsigned int iris1_irq_ack_stage;
 module_param(iris1_irq_ack_stage, uint, 0400);
 MODULE_PARM_DESC(iris1_irq_ack_stage,
-		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=masked-stop, 4=CPU-mask-stop");
+		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=masked-stop, 4=CPU-mask-stop, 5=mask-full-clear-verify");
 
 static unsigned int iris1_irq_checkpoint_ms;
 module_param(iris1_irq_checkpoint_ms, uint, 0400);
@@ -632,7 +637,32 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 			 ctrl_status, count);
 
 	if (!ret && IS_IRIS1(hdev->core) && iris1_run_stage == 6 &&
-	    iris1_irq_ack_stage != 0) {
+	    iris1_irq_ack_stage == 5) {
+		unsigned int wait_ms;
+
+		wait_ms = clamp(iris1_irq_checkpoint_ms, 250U, 2000U);
+		if (!wait_for_completion_timeout(&hdev->iris1_irq_ack_done,
+						 msecs_to_jiffies(wait_ms))) {
+			dev_err(dev,
+				"Iris1 IRQ diagnostic stage 5 timeout after %u ms\n",
+				wait_ms);
+			return -ETIMEDOUT;
+		}
+
+		synchronize_irq(hdev->core->irq);
+		dev_info(dev,
+			 "Iris1 IRQ diagnostic stage 5 readback: status=%#x mask=%#x poll-ret=%d complete=%u\n",
+			 hdev->iris1_irq_status_after,
+			 hdev->iris1_irq_mask_after,
+			 hdev->iris1_irq_ack_ret,
+			 hdev->iris1_irq_ack_complete);
+		if (!hdev->iris1_irq_ack_complete)
+			return -EIO;
+
+		dev_info(dev,
+			 "Iris1 IRQ diagnostic stage 5 verified: source masked and A2H status cleared\n");
+	} else if (!ret && IS_IRIS1(hdev->core) && iris1_run_stage == 6 &&
+		   iris1_irq_ack_stage != 0) {
 		synchronize_irq(hdev->core->irq);
 		dev_info(dev,
 			 "Iris1 IRQ diagnostic handler quiesced before cleanup\n");
@@ -725,7 +755,11 @@ static int venus_run(struct venus_hfi_device *hdev)
 
 	ret = venus_boot_core(hdev);
 	if (ret) {
-		dev_err(dev, "failed to reset venus core\n");
+		if (IS_IRIS1(hdev->core) && ret == -ECANCELED)
+			dev_info(dev,
+				 "Iris1 diagnostic stop after boot-core completed\n");
+		else
+			dev_err(dev, "failed to boot venus core (%d)\n", ret);
 		return ret;
 	}
 
@@ -1382,6 +1416,54 @@ static irqreturn_t venus_isr(struct venus_core *core)
 		return IRQ_HANDLED;
 	}
 
+	if (IS_IRIS1(core) && iris1_irq_ack_stage == 5) {
+		u32 ack_mask = WRAPPER_INTR_MASK_A2HWD_BASK |
+			       WRAPPER_INTR_MASK_A2HCPU_MASK;
+		u32 mask, mask_after, status_after;
+		int ack_ret;
+
+		/*
+		 * This IRQ is level-high.  Quiesce the source before acknowledging
+		 * it, then use the complete Iris1 sequence from the downstream
+		 * driver: CPU clear followed by writing the captured wrapper status
+		 * back to WRAPPER_INTR_CLEAR.  Readbacks flush the posted writes and
+		 * give the probe path a hard pass/fail condition before power-off.
+		 */
+		mask = readl(wrapper_base + WRAPPER_INTR_MASK) | ack_mask;
+		dev_info(core->dev,
+			 "Iris1 IRQ stage 5: mask source status=%#x target-mask=%#x\n",
+			 status, mask);
+		writel(mask, wrapper_base + WRAPPER_INTR_MASK);
+		mask_after = readl(wrapper_base + WRAPPER_INTR_MASK);
+
+		dev_info(core->dev, "Iris1 IRQ stage 5: CPU clear start\n");
+		writel(1, cpu_cs_base + CPU_CS_A2HSOFTINTCLR);
+		dev_info(core->dev,
+			 "Iris1 IRQ stage 5: wrapper full clear=%#x start\n",
+			 status);
+		writel(status, wrapper_base + WRAPPER_INTR_CLEAR);
+		ack_ret = readl_poll_timeout_atomic(
+			wrapper_base + WRAPPER_INTR_STATUS, status_after,
+			!(status_after & (WRAPPER_INTR_STATUS_A2H_MASK |
+					   WRAPPER_INTR_STATUS_A2HWD_MASK)),
+			1, 100);
+
+		hdev->iris1_irq_mask_after = mask_after;
+		hdev->iris1_irq_status_after = status_after;
+		hdev->iris1_irq_ack_ret = ack_ret;
+		hdev->iris1_irq_ack_complete =
+			!ack_ret &&
+			(mask_after & ack_mask) == ack_mask &&
+			!(status_after & (WRAPPER_INTR_STATUS_A2H_MASK |
+					  WRAPPER_INTR_STATUS_A2HWD_MASK));
+		dev_info(core->dev,
+			 "Iris1 IRQ stage 5: ACK readback status=%#x mask=%#x poll-ret=%d complete=%u\n",
+			 status_after, mask_after, ack_ret,
+			 hdev->iris1_irq_ack_complete);
+		complete(&hdev->iris1_irq_ack_done);
+		return IRQ_HANDLED;
+	}
+
 	if (IS_IRIS1(core))
 		dev_info(core->dev, "Iris1 IRQ ACK: CPU clear start\n");
 	writel(1, cpu_cs_base + CPU_CS_A2HSOFTINTCLR);
@@ -2008,12 +2090,19 @@ void venus_hfi_destroy(struct venus_core *core)
 {
 	struct venus_hfi_device *hdev = to_hfi_priv(core);
 
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 HFI destroy: IRQ disable start\n");
+	disable_irq(core->irq);
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 HFI destroy: IRQ quiesced\n");
+
 	core->priv = NULL;
 	venus_interface_queues_release(hdev);
 	mutex_destroy(&hdev->lock);
 	kfree(hdev);
-	disable_irq(core->irq);
 	core->ops = NULL;
+	if (IS_IRIS1(core))
+		dev_info(core->dev, "Iris1 HFI destroy: resources released\n");
 }
 
 int venus_hfi_create(struct venus_core *core)
@@ -2027,7 +2116,7 @@ int venus_hfi_create(struct venus_core *core)
 		return -EINVAL;
 	}
 
-	if (IS_IRIS1(core) && iris1_irq_ack_stage > 4) {
+	if (IS_IRIS1(core) && iris1_irq_ack_stage > 5) {
 		dev_err(core->dev, "invalid Iris1 IRQ ACK stage %u\n",
 			iris1_irq_ack_stage);
 		return -EINVAL;
@@ -2043,6 +2132,7 @@ int venus_hfi_create(struct venus_core *core)
 		return -ENOMEM;
 
 	mutex_init(&hdev->lock);
+	init_completion(&hdev->iris1_irq_ack_done);
 
 	hdev->core = core;
 	hdev->suspended = true;

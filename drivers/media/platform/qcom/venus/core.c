@@ -418,7 +418,7 @@ static int venus_probe(struct platform_device *pdev)
 	struct venus_core *core;
 	const char *stage = "allocate core";
 	bool runtime_powered = false;
-	int power_ret, icc_ret, ret;
+	int shutdown_ret, power_ret, icc_ret, ret;
 
 	core = devm_kzalloc(dev, sizeof(*core), GFP_KERNEL);
 	if (!core)
@@ -644,9 +644,21 @@ err_remove_dynamic_nodes:
 err_core_deinit:
 	hfi_core_deinit(core, false);
 err_venus_shutdown:
-	venus_shutdown(core);
+	if (IS_IRIS1(core))
+		dev_info(dev, "probe cleanup: PAS shutdown start\n");
+	shutdown_ret = venus_shutdown(core);
+	if (IS_IRIS1(core))
+		dev_info(dev, "probe cleanup: PAS shutdown done ret=%d\n",
+			 shutdown_ret);
+	if (shutdown_ret)
+		dev_warn(dev, "probe cleanup: firmware shutdown failed (%d)\n",
+			 shutdown_ret);
 err_firmware_deinit:
+	if (IS_IRIS1(core))
+		dev_info(dev, "probe cleanup: firmware deinit start\n");
 	venus_firmware_deinit(core);
+	if (IS_IRIS1(core))
+		dev_info(dev, "probe cleanup: firmware deinit done\n");
 err_runtime_disable:
 	/*
 	 * A failed HFI handshake cannot use the normal runtime suspend path:
@@ -655,13 +667,16 @@ err_runtime_disable:
 	 * GDSCs enabled and destabilize the next boot or probe attempt.
 	 */
 	if (runtime_powered) {
-		dev_info(dev, "probe cleanup: forcing runtime hardware off\n");
+		dev_info(dev, "probe cleanup: forcing runtime hardware off start\n");
 		power_ret = 0;
 		if (core->pm_ops->core_power)
 			power_ret = core->pm_ops->core_power(core, POWER_OFF);
 		if (power_ret)
 			dev_warn(dev, "probe cleanup: core power-off failed (%d)\n",
 				 power_ret);
+		else
+			dev_info(dev,
+				 "probe cleanup: runtime hardware off done\n");
 	}
 
 	icc_ret = icc_set_bw(core->cpucfg_path, 0, 0);
@@ -679,11 +694,23 @@ err_runtime_disable:
 	pm_runtime_set_suspended(dev);
 	v4l2_device_unregister(&core->v4l2_dev);
 err_hfi_destroy:
+	if (IS_IRIS1(core))
+		dev_info(dev, "probe cleanup: HFI destroy start\n");
 	hfi_destroy(core);
+	if (IS_IRIS1(core))
+		dev_info(dev, "probe cleanup: HFI destroy done\n");
 err_core_put:
-	dev_err_probe(dev, ret, "probe failed at stage: %s\n", stage);
-	if (core->pm_ops->core_put)
+	if (core->pm_ops->core_put) {
+		if (IS_IRIS1(core))
+			dev_info(dev, "probe cleanup: core resources put start\n");
 		core->pm_ops->core_put(core);
+		if (IS_IRIS1(core))
+			dev_info(dev, "probe cleanup: core resources put done\n");
+	}
+	if (IS_IRIS1(core))
+		dev_info(dev, "probe cleanup complete before returning error=%d\n",
+			 ret);
+	dev_err_probe(dev, ret, "probe failed at stage: %s\n", stage);
 	return ret;
 }
 
