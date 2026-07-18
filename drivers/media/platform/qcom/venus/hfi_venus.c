@@ -159,17 +159,19 @@ MODULE_PARM_DESC(iris1_run_stage,
  * sequence; stage 3 performs a masked wrapper clear, stage 4 masks the wrapper
  * after the CPU clear without touching WRAPPER_INTR_CLEAR, and stage 5 first
  * masks the source, then performs the complete Qualcomm Iris1 ACK sequence and
- * verifies the register readback before teardown.
+ * verifies the register readback before teardown.  Stage 6 keeps both the
+ * wrapper source and Linux IRQ disabled, then boots and acknowledges entirely
+ * from probe context so no interrupt can reach the GIC.
  */
 static unsigned int iris1_irq_ack_stage;
 module_param(iris1_irq_ack_stage, uint, 0400);
 MODULE_PARM_DESC(iris1_irq_ack_stage,
-		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=masked-stop, 4=CPU-mask-stop, 5=mask-full-clear-verify");
+		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=masked-stop, 4=CPU-mask-stop, 5=mask-full-clear-verify, 6=masked-poll-verify");
 
 static unsigned int iris1_irq_checkpoint_ms;
 module_param(iris1_irq_checkpoint_ms, uint, 0400);
 MODULE_PARM_DESC(iris1_irq_checkpoint_ms,
-		 "Iris1 pre-trigger delay and stage 5 ACK wait in milliseconds");
+		 "Iris1 pre-trigger delay and stage 5/6 checkpoint wait in milliseconds");
 
 static int venus_iris1_run_stop(struct venus_hfi_device *hdev,
 				unsigned int stage, const char *name)
@@ -542,15 +544,107 @@ static int venus_hfi_core_set_resource(struct venus_core *core, u32 id,
 	return 0;
 }
 
+static int venus_iris1_poll_ack(struct venus_hfi_device *hdev,
+				unsigned int delay_ms, u32 ctrl_status)
+{
+	struct venus_core *core = hdev->core;
+	void __iomem *cpu_cs_base = core->cpu_cs_base;
+	void __iomem *cpu_ic_base = core->cpu_ic_base;
+	void __iomem *wrapper_base = core->wrapper_base;
+	u32 ack_mask = WRAPPER_INTR_MASK_A2HWD_BASK |
+		       WRAPPER_INTR_MASK_A2HCPU_MASK;
+	u32 intr_status, mask_after, status_after;
+	u32 cpu_irq_before, cpu_raw_before, cpu_enable_before;
+	u32 cpu_irq_after, cpu_raw_after;
+	int ret, status_ret;
+
+	/*
+	 * Stage 6 runs only after disable_irq() and with both wrapper sources
+	 * masked.  Keep all MMIO and polling in probe context: this determines
+	 * whether the first boot event is safe without entering the GIC/hardirq
+	 * return path that wedged the stage 5 experiments.
+	 */
+	status_ret = readl_poll_timeout(wrapper_base + WRAPPER_INTR_STATUS,
+					intr_status,
+					intr_status &
+					WRAPPER_INTR_STATUS_A2H_MASK,
+					10, 10000);
+	mask_after = readl(wrapper_base + WRAPPER_INTR_MASK);
+	cpu_irq_before = readl(cpu_ic_base + CPU_IC_IRQSTATUS);
+	cpu_raw_before = readl(cpu_ic_base + CPU_IC_RAWINTR);
+	cpu_enable_before = readl(cpu_ic_base + CPU_IC_INTENABLE);
+	hdev->irq_status = intr_status;
+
+	dev_info(core->dev,
+		 "Iris1 IRQ stage 6 snapshot: ctrl=%#x status=%#x mask=%#x cpu-irq=%#x raw=%#x enable=%#x status-poll-ret=%d\n",
+		 ctrl_status, intr_status, mask_after, cpu_irq_before,
+		 cpu_raw_before, cpu_enable_before, status_ret);
+	msleep(delay_ms);
+
+	if (status_ret)
+		return dev_err_probe(core->dev, -ETIMEDOUT,
+				     "Iris1 IRQ stage 6: boot ready without A2H status, refusing ACK\n");
+
+	dev_info(core->dev,
+		 "Iris1 IRQ stage 6: CPU clear start in probe context\n");
+	writel(1, cpu_cs_base + CPU_CS_A2HSOFTINTCLR);
+	cpu_irq_after = readl(cpu_ic_base + CPU_IC_IRQSTATUS);
+	cpu_raw_after = readl(cpu_ic_base + CPU_IC_RAWINTR);
+	dev_info(core->dev,
+		 "Iris1 IRQ stage 6: CPU clear committed cpu-irq=%#x raw=%#x\n",
+		 cpu_irq_after, cpu_raw_after);
+
+	dev_info(core->dev,
+		 "Iris1 IRQ stage 6: wrapper full clear=%#x start in probe context\n",
+		 intr_status);
+	writel(intr_status, wrapper_base + WRAPPER_INTR_CLEAR);
+	ret = readl_poll_timeout(wrapper_base + WRAPPER_INTR_STATUS,
+				 status_after,
+				 !(status_after &
+				   (WRAPPER_INTR_STATUS_A2H_MASK |
+				    WRAPPER_INTR_STATUS_A2HWD_MASK)),
+				 10, 1000);
+	mask_after = readl(wrapper_base + WRAPPER_INTR_MASK);
+	cpu_irq_after = readl(cpu_ic_base + CPU_IC_IRQSTATUS);
+	cpu_raw_after = readl(cpu_ic_base + CPU_IC_RAWINTR);
+
+	hdev->iris1_irq_mask_after = mask_after;
+	hdev->iris1_irq_status_after = status_after;
+	hdev->iris1_irq_ack_ret = ret;
+	hdev->iris1_irq_ack_complete =
+		!ret && (mask_after & ack_mask) == ack_mask &&
+		!(status_after & (WRAPPER_INTR_STATUS_A2H_MASK |
+				  WRAPPER_INTR_STATUS_A2HWD_MASK));
+	dev_info(core->dev,
+		 "Iris1 IRQ stage 6 readback: status=%#x mask=%#x cpu-irq=%#x raw=%#x poll-ret=%d complete=%u\n",
+		 status_after, mask_after, cpu_irq_after, cpu_raw_after, ret,
+		 hdev->iris1_irq_ack_complete);
+
+	if (!hdev->iris1_irq_ack_complete)
+		return -EIO;
+
+	dev_info(core->dev,
+		 "Iris1 IRQ diagnostic stage 6 verified: GIC bypassed, boot ready and A2H status cleared\n");
+	msleep(delay_ms);
+
+	return 0;
+}
+
 static int venus_boot_core(struct venus_hfi_device *hdev)
 {
 	struct device *dev = hdev->core->dev;
 	static const unsigned int max_tries = 1000;
-	u32 ctrl_status = 0, intr_status, mask_val = 0;
+	u32 ctrl_status = 0, intr_status, mask_readback, mask_val = 0;
+	bool iris1_poll_only;
 	unsigned int count = 0;
+	unsigned int delay_ms;
 	void __iomem *cpu_cs_base = hdev->core->cpu_cs_base;
 	void __iomem *wrapper_base = hdev->core->wrapper_base;
 	int ret = 0;
+
+	iris1_poll_only = IS_IRIS1(hdev->core) &&
+			  iris1_irq_ack_stage == 6;
+	delay_ms = min(iris1_irq_checkpoint_ms, 1000U);
 
 	if (IS_IRIS1(hdev->core))
 		dev_info(dev, "Iris1 boot-core: interrupt setup start\n");
@@ -561,38 +655,64 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 			      WRAPPER_INTR_MASK_A2HCPU_MASK);
 	} else if (IS_IRIS1(hdev->core)) {
 		mask_val = readl(wrapper_base + WRAPPER_INTR_MASK);
-		mask_val &= ~(WRAPPER_INTR_MASK_A2HWD_BASK |
-			      WRAPPER_INTR_MASK_A2HCPU_MASK);
+		if (iris1_poll_only)
+			mask_val |= WRAPPER_INTR_MASK_A2HWD_BASK |
+				    WRAPPER_INTR_MASK_A2HCPU_MASK;
+		else
+			mask_val &= ~(WRAPPER_INTR_MASK_A2HWD_BASK |
+				      WRAPPER_INTR_MASK_A2HCPU_MASK);
 	} else {
 		mask_val = WRAPPER_INTR_MASK_A2HVCODEC_MASK;
 	}
 
 	if (IS_IRIS1(hdev->core) && iris1_irq_ack_stage >= 3) {
-		unsigned int delay_ms = min(iris1_irq_checkpoint_ms, 1000U);
-
 		intr_status = readl(wrapper_base + WRAPPER_INTR_STATUS);
 		dev_info(dev,
-			 "Iris1 IRQ diagnostic: stage=%u armed pre-unmask status=%#x target-mask=%#x; trigger in %u ms\n",
-			 iris1_irq_ack_stage, intr_status, mask_val, delay_ms);
+			 "Iris1 IRQ diagnostic: stage=%u armed pre-trigger status=%#x target-mask=%#x path=%s; setup in %u ms\n",
+			 iris1_irq_ack_stage, intr_status, mask_val,
+			 iris1_poll_only ? "masked-poll" : "hardirq", delay_ms);
 		msleep(delay_ms);
 		intr_status = readl(wrapper_base + WRAPPER_INTR_STATUS);
 		dev_info(dev,
-			 "Iris1 IRQ diagnostic: pre-unmask recheck status=%#x\n",
+			 "Iris1 IRQ diagnostic: pre-trigger recheck status=%#x\n",
 			 intr_status);
 
 		if (intr_status & (WRAPPER_INTR_STATUS_A2H_MASK |
 				   WRAPPER_INTR_STATUS_A2HWD_MASK |
 				   CPU_CS_SCIACMDARG0_INIT_IDLE_MSG_MASK)) {
 			dev_err(dev,
-				"Iris1 IRQ diagnostic refused: pending pre-unmask status=%#x\n",
+				"Iris1 IRQ diagnostic refused: pending pre-trigger status=%#x\n",
 				intr_status);
 			return -EBUSY;
 		}
 	}
 
+	if (iris1_poll_only) {
+		dev_info(dev,
+			 "Iris1 IRQ stage 6: Linux IRQ disable start before trigger\n");
+		disable_irq(hdev->core->irq);
+		hdev->irq_disabled = true;
+		dev_info(dev,
+			 "Iris1 IRQ stage 6: Linux IRQ disabled before trigger\n");
+	}
+
 	writel(mask_val, wrapper_base + WRAPPER_INTR_MASK);
-	if (IS_IRIS1(hdev->core))
-		dev_info(dev, "Iris1 interrupts unmasked: mask=%#x\n", mask_val);
+	mask_readback = readl(wrapper_base + WRAPPER_INTR_MASK);
+	if (iris1_poll_only) {
+		u32 ack_mask = WRAPPER_INTR_MASK_A2HWD_BASK |
+			       WRAPPER_INTR_MASK_A2HCPU_MASK;
+
+		dev_info(dev,
+			 "Iris1 IRQ stage 6: wrapper source masked before trigger mask=%#x\n",
+			 mask_readback);
+		if ((mask_readback & ack_mask) != ack_mask)
+			return dev_err_probe(dev, -EIO,
+					     "Iris1 IRQ stage 6: wrapper mask readback failed\n");
+		msleep(delay_ms);
+	} else if (IS_IRIS1(hdev->core)) {
+		dev_info(dev, "Iris1 interrupts unmasked: mask=%#x\n",
+			 mask_readback);
+	}
 
 	ret = venus_iris1_run_stop(hdev, 5, "interrupt setup");
 	if (ret)
@@ -676,6 +796,10 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 
 		dev_info(dev,
 			 "Iris1 IRQ diagnostic stage 5 verified: source masked and A2H status cleared\n");
+	} else if (!ret && iris1_poll_only && iris1_run_stage == 6) {
+		ret = venus_iris1_poll_ack(hdev, delay_ms, ctrl_status);
+		if (ret)
+			return ret;
 	} else if (!ret && IS_IRIS1(hdev->core) && iris1_run_stage == 6 &&
 		   iris1_irq_ack_stage != 0) {
 		synchronize_irq(hdev->core->irq);
@@ -2152,8 +2276,15 @@ int venus_hfi_create(struct venus_core *core)
 		return -EINVAL;
 	}
 
-	if (IS_IRIS1(core) && iris1_irq_ack_stage > 5) {
+	if (IS_IRIS1(core) && iris1_irq_ack_stage > 6) {
 		dev_err(core->dev, "invalid Iris1 IRQ ACK stage %u\n",
+			iris1_irq_ack_stage);
+		return -EINVAL;
+	}
+
+	if (IS_IRIS1(core) && iris1_irq_ack_stage && iris1_run_stage != 6) {
+		dev_err(core->dev,
+			"Iris1 IRQ ACK stage %u requires run stage 6\n",
 			iris1_irq_ack_stage);
 		return -EINVAL;
 	}
