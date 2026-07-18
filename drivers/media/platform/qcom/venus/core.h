@@ -147,6 +147,7 @@ struct venus_format {
  * @cpucfg_path: an interconnect handle to cpu configuration path
  * @pmdomains:	a pointer to a list of pmdomains
  * @opp_pmdomain: an OPP power-domain
+ * @iris1_boot_opp_applied: the diagnostic boot path owns an OPP rate vote
  * @resets: an array of reset signals
  * @vdev_dec:	a reference to video device structure for decoder instances
  * @vdev_enc:	a reference to video device structure for encoder instances
@@ -202,6 +203,7 @@ struct venus_core {
 	struct icc_path *cpucfg_path;
 	struct dev_pm_domain_list *pmdomains;
 	struct dev_pm_domain_list *opp_pmdomain;
+	bool iris1_boot_opp_applied;
 	struct reset_control *resets[VIDC_RESETS_NUM_MAX];
 	struct video_device *vdev_dec;
 	struct video_device *vdev_enc;

@@ -24,10 +24,15 @@
 
 static bool legacy_binding;
 
-static unsigned long iris1_boot_rate_hz = 240000000;
+static unsigned long iris1_boot_rate_hz = 200000000;
 module_param(iris1_boot_rate_hz, ulong, 0400);
 MODULE_PARM_DESC(iris1_boot_rate_hz,
 		 "Iris1 boot clock rate requested before firmware start");
+
+static bool iris1_boot_apply_opp;
+module_param(iris1_boot_apply_opp, bool, 0400);
+MODULE_PARM_DESC(iris1_boot_apply_opp,
+		 "Apply the Iris1 OPP and required power-domain state before clocks");
 
 static void iris1_resource_checkpoint(struct venus_core *core,
 				      const char *stage)
@@ -63,7 +68,6 @@ static int core_clks_enable(struct venus_core *core)
 	unsigned long requested_freq = 0;
 	unsigned long freq;
 	struct dev_pm_opp *opp;
-	bool opp_rate_set = false;
 	unsigned int i;
 	int ret;
 
@@ -85,16 +89,16 @@ static int core_clks_enable(struct venus_core *core)
 
 	if (IS_IRIS1(core))
 		dev_info(dev,
-			 "Iris1 boot clock selection: requested=%lu selected-opp=%lu\n",
-			 requested_freq, freq);
+			 "Iris1 boot clock selection: requested=%lu selected-opp=%lu apply-opp=%u\n",
+			 requested_freq, freq, iris1_boot_apply_opp);
 
-	if (IS_IRIS1(core) && core->opp_pmdomain) {
+	if (IS_IRIS1(core) && iris1_boot_apply_opp && core->opp_pmdomain) {
 		ret = dev_pm_opp_set_rate(dev, freq);
 		if (ret)
 			return dev_err_probe(dev, ret,
 					     "failed to apply Iris1 boot OPP %lu\n",
 					     freq);
-		opp_rate_set = true;
+		core->iris1_boot_opp_applied = true;
 		dev_info(dev,
 			 "Iris1 boot OPP and required power-domain state applied\n");
 	}
@@ -126,8 +130,10 @@ static int core_clks_enable(struct venus_core *core)
 err:
 	while (i--)
 		clk_disable_unprepare(core->clks[i]);
-	if (opp_rate_set)
+	if (IS_IRIS1(core) && core->iris1_boot_opp_applied) {
 		dev_pm_opp_set_rate(dev, 0);
+		core->iris1_boot_opp_applied = false;
+	}
 
 	return ret;
 }
@@ -1182,9 +1188,13 @@ static int core_power_v4(struct venus_core *core, int on)
 				 clk_get_rate(core->vcodec0_clks[0]));
 		}
 	} else {
-		/* Drop the performance state vote */
-		if (core->opp_pmdomain)
+		/* Drop only a performance-state vote owned by this path. */
+		if (IS_IRIS1(core) && core->iris1_boot_opp_applied) {
 			dev_pm_opp_set_rate(dev, 0);
+			core->iris1_boot_opp_applied = false;
+		} else if (!IS_IRIS1(core) && core->opp_pmdomain) {
+			dev_pm_opp_set_rate(dev, 0);
+		}
 
 		if (IS_IRIS1(core)) {
 			dev_info(dev, "Iris1 power-off: disabling vcodec0 clock\n");
@@ -1206,8 +1216,12 @@ static int core_power_v4(struct venus_core *core, int on)
 
 err_core_clks:
 	core_clks_disable(core);
-	if (core->opp_pmdomain)
+	if (IS_IRIS1(core) && core->iris1_boot_opp_applied) {
 		dev_pm_opp_set_rate(dev, 0);
+		core->iris1_boot_opp_applied = false;
+	} else if (!IS_IRIS1(core) && core->opp_pmdomain) {
+		dev_pm_opp_set_rate(dev, 0);
+	}
 err_vcodec_domain:
 	if (IS_IRIS1(core) && vcodec0)
 		pm_runtime_put_sync(vcodec0);

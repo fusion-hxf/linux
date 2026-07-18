@@ -50,15 +50,20 @@ MODULE_PARM_DESC(iris1_probe_stage,
  * compare conservative and downstream-equivalent votes after a cold boot.
  * Values are in the kB/s units accepted by icc_set_bw().
  */
-static unsigned int iris1_boot_video_bw_kbps = 6533000;
+static unsigned int iris1_boot_video_bw_kbps = 2500;
 module_param(iris1_boot_video_bw_kbps, uint, 0400);
 MODULE_PARM_DESC(iris1_boot_video_bw_kbps,
 		 "Iris1 boot video-memory average bandwidth in ICC kB/s");
 
-static unsigned int iris1_boot_proc_bw_kbps = 1000;
+static unsigned int iris1_boot_proc_bw_kbps;
 module_param(iris1_boot_proc_bw_kbps, uint, 0400);
 MODULE_PARM_DESC(iris1_boot_proc_bw_kbps,
 		 "Iris1 firmware-processor memory bandwidth in ICC kB/s");
+
+static bool iris1_boot_use_proc_icc;
+module_param(iris1_boot_use_proc_icc, bool, 0400);
+MODULE_PARM_DESC(iris1_boot_use_proc_icc,
+		 "Acquire and vote the Iris1 firmware-processor interconnect");
 
 static u32 venus_boot_video_bw(struct venus_core *core)
 {
@@ -70,7 +75,7 @@ static u32 venus_boot_video_bw(struct venus_core *core)
 
 static u32 venus_boot_proc_bw(struct venus_core *core)
 {
-	if (IS_IRIS1(core))
+	if (IS_IRIS1(core) && iris1_boot_use_proc_icc)
 		return iris1_boot_proc_bw_kbps;
 
 	return 0;
@@ -494,7 +499,7 @@ static int venus_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(core->cpucfg_path),
 				     "failed to get cpu-cfg interconnect\n");
 
-	if (IS_IRIS1(core)) {
+	if (IS_IRIS1(core) && iris1_boot_use_proc_icc) {
 		core->video_proc_path =
 			devm_of_icc_get(dev, "video-processor");
 		if (IS_ERR(core->video_proc_path))
@@ -887,8 +892,9 @@ static __maybe_unused int venus_runtime_resume(struct device *dev)
 
 	if (IS_IRIS1(core))
 		dev_info(dev,
-			 "Iris1 boot ICC configuration: video-mem=%u kB/s video-processor=%u kB/s cpu-cfg=%u kB/s\n",
-			 video_bw, proc_bw, kbps_to_icc(1000));
+			 "Iris1 boot ICC configuration: video-mem=%u kB/s video-processor=%u kB/s use-video-processor=%u cpu-cfg=%u kB/s\n",
+			 video_bw, proc_bw, iris1_boot_use_proc_icc,
+			 kbps_to_icc(1000));
 
 	venus_iris1_checkpoint(core, "video-mem ICC vote start");
 	ret = icc_set_bw(core->video_path, video_bw, 0);

@@ -164,17 +164,19 @@ MODULE_PARM_DESC(iris1_run_stage,
  * from probe context so no interrupt can reach the GIC.  Stage 7 keeps the
  * same masking but deliberately performs no Venus MMIO after CTRL_INIT; its
  * delayed heartbeat distinguishes a blocked status read from firmware/NoC
- * failure caused by the trigger itself.
+ * failure caused by the trigger itself.  Stage 8 preserves the exact
+ * unmasked sequence which previously reached boot-ready on Raphael, including
+ * avoiding a wrapper-mask readback before CTRL_INIT.
  */
 static unsigned int iris1_irq_ack_stage;
 module_param(iris1_irq_ack_stage, uint, 0400);
 MODULE_PARM_DESC(iris1_irq_ack_stage,
-		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=masked-stop, 4=CPU-mask-stop, 5=mask-full-clear-verify, 6=masked-poll-verify, 7=masked-trigger-no-read");
+		 "Iris1 IRQ ACK: 0=full, 1=status-only, 2=CPU-clear, 3=masked-stop, 4=CPU-mask-stop, 5=mask-full-clear-verify, 6=masked-poll-verify, 7=masked-trigger-no-read, 8=legacy-exact");
 
 static unsigned int iris1_irq_checkpoint_ms;
 module_param(iris1_irq_checkpoint_ms, uint, 0400);
 MODULE_PARM_DESC(iris1_irq_checkpoint_ms,
-		 "Iris1 pre-trigger delay and stage 5/6/7 checkpoint wait in milliseconds");
+		 "Iris1 pre-trigger delay and stage 5/6/7/8 checkpoint wait in milliseconds");
 
 static int venus_iris1_run_stop(struct venus_hfi_device *hdev,
 				unsigned int stage, const char *name)
@@ -633,6 +635,95 @@ static int venus_iris1_poll_ack(struct venus_hfi_device *hdev,
 	return 0;
 }
 
+/*
+ * Preserve the exact boot sequence which reached SCIACMDARG0=1 on Raphael.
+ * Keep this isolated from the newer masked/GIC-bypass diagnostics so one
+ * kernel can distinguish a power-resource regression from a boot sequencing
+ * regression after a physical cold boot.
+ */
+static int venus_iris1_boot_legacy_exact(struct venus_hfi_device *hdev)
+{
+	struct venus_core *core = hdev->core;
+	struct device *dev = core->dev;
+	static const unsigned int max_tries = 1000;
+	void __iomem *cpu_cs_base = core->cpu_cs_base;
+	void __iomem *wrapper_base = core->wrapper_base;
+	unsigned int delay_ms = min(iris1_irq_checkpoint_ms, 1000U);
+	unsigned int count = 0;
+	u32 ctrl_status = 0;
+	u32 intr_status;
+	u32 mask_val;
+	int ret = 0;
+
+	mask_val = readl(wrapper_base + WRAPPER_INTR_MASK);
+	mask_val &= ~(WRAPPER_INTR_MASK_A2HWD_BASK |
+		      WRAPPER_INTR_MASK_A2HCPU_MASK);
+
+	intr_status = readl(wrapper_base + WRAPPER_INTR_STATUS);
+	dev_info(dev,
+		 "Iris1 IRQ stage 8 legacy-exact: armed pre-unmask status=%#x target-mask=%#x; trigger in %u ms\n",
+		 intr_status, mask_val, delay_ms);
+	msleep(delay_ms);
+	intr_status = readl(wrapper_base + WRAPPER_INTR_STATUS);
+	dev_info(dev,
+		 "Iris1 IRQ stage 8 legacy-exact: pre-unmask recheck status=%#x\n",
+		 intr_status);
+
+	if (intr_status & (WRAPPER_INTR_STATUS_A2H_MASK |
+			   WRAPPER_INTR_STATUS_A2HWD_MASK |
+			   CPU_CS_SCIACMDARG0_INIT_IDLE_MSG_MASK))
+		return dev_err_probe(dev, -EBUSY,
+				     "Iris1 IRQ stage 8 refused: pending pre-unmask status=%#x\n",
+				     intr_status);
+
+	/* Deliberately no mask readback: this mirrors the known boot-ready path. */
+	writel(mask_val, wrapper_base + WRAPPER_INTR_MASK);
+	dev_info(dev,
+		 "Iris1 IRQ stage 8 legacy-exact: interrupts unmasked mask=%#x\n",
+		 mask_val);
+
+	ret = venus_iris1_run_stop(hdev, 5, "legacy-exact interrupt setup");
+	if (ret)
+		return ret;
+
+	writel(BIT(VIDC_CTRL_INIT_CTRL_SHIFT), cpu_cs_base + VIDC_CTRL_INIT);
+	dev_info(dev,
+		 "Iris1 IRQ stage 8 legacy-exact: VIDC_CTRL_INIT write committed; polling status\n");
+	while (!ctrl_status && count < max_tries) {
+		ctrl_status = readl(cpu_cs_base + CPU_CS_SCIACMDARG0);
+		if ((ctrl_status & CPU_CS_SCIACMDARG0_ERROR_STATUS_MASK) == 4) {
+			dev_err(dev, "invalid setting for UC_REGION\n");
+			ret = -EINVAL;
+			break;
+		}
+
+		usleep_range(50, 100);
+		count++;
+	}
+
+	if (!ctrl_status) {
+		dev_err(dev,
+			"Iris1 IRQ stage 8 boot timeout: init=%#x status=%#x\n",
+			readl(cpu_cs_base + VIDC_CTRL_INIT), ctrl_status);
+		ret = -ETIMEDOUT;
+	}
+
+	if (ret)
+		return ret;
+
+	dev_info(dev,
+		 "Iris1 IRQ stage 8 legacy-exact boot ready: status=%#x polls=%u\n",
+		 ctrl_status, count);
+
+	if (iris1_run_stage == 6) {
+		synchronize_irq(core->irq);
+		dev_info(dev,
+			 "Iris1 IRQ stage 8 legacy-exact: IRQ handler quiesced before cleanup\n");
+	}
+
+	return venus_iris1_run_stop(hdev, 6, "legacy-exact boot ready");
+}
+
 static int venus_boot_core(struct venus_hfi_device *hdev)
 {
 	struct device *dev = hdev->core->dev;
@@ -645,6 +736,9 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	void __iomem *cpu_cs_base = hdev->core->cpu_cs_base;
 	void __iomem *wrapper_base = hdev->core->wrapper_base;
 	int ret = 0;
+
+	if (IS_IRIS1(hdev->core) && iris1_irq_ack_stage == 8)
+		return venus_iris1_boot_legacy_exact(hdev);
 
 	iris1_poll_only = IS_IRIS1(hdev->core) &&
 			  iris1_irq_ack_stage == 6;
@@ -1661,7 +1755,8 @@ static irqreturn_t venus_isr(struct venus_core *core)
 		return IRQ_HANDLED;
 	}
 
-	if (IS_IRIS1(core) && iris1_irq_ack_stage == 4) {
+	if (IS_IRIS1(core) &&
+	    (iris1_irq_ack_stage == 4 || iris1_irq_ack_stage == 8)) {
 		u32 mask = readl(wrapper_base + WRAPPER_INTR_MASK);
 
 		mask |= WRAPPER_INTR_MASK_A2HWD_BASK |
@@ -1671,7 +1766,8 @@ static irqreturn_t venus_isr(struct venus_core *core)
 			 status, mask);
 		writel(mask, wrapper_base + WRAPPER_INTR_MASK);
 		dev_info(core->dev,
-			 "Iris1 IRQ diagnostic stop: CPU clear and wrapper mask committed\n");
+			 "Iris1 IRQ stage %u diagnostic stop: CPU clear and wrapper mask committed\n",
+			 iris1_irq_ack_stage);
 		disable_irq_nosync(core->irq);
 		hdev->irq_disabled = true;
 		return IRQ_HANDLED;
@@ -2307,7 +2403,7 @@ int venus_hfi_create(struct venus_core *core)
 		return -EINVAL;
 	}
 
-	if (IS_IRIS1(core) && iris1_irq_ack_stage > 7) {
+	if (IS_IRIS1(core) && iris1_irq_ack_stage > 8) {
 		dev_err(core->dev, "invalid Iris1 IRQ ACK stage %u\n",
 			iris1_irq_ack_stage);
 		return -EINVAL;
